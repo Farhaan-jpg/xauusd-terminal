@@ -1,0 +1,58 @@
+# Render Blueprint — ONE free Web Service hosting both processes:
+#   - API (Express)  -> internal 0.0.0.0:4000   (API_HOST/API_PORT)
+#   - Web (Next.js)  -> Render's public $PORT, proxies /api/* -> :4000
+# Free tier explains the layout: no persistent disk, 15-min idle spin-down,
+# 750 instance-hours/month. cron-job.org pings /api/status every ~10 min to
+# act as keep-alive traffic (see the deployment guide).
+#
+# Deploy: New+ -> Blueprint Instance -> select the GitHub repo (render.yaml auto-detected),
+# or use this pre-built URL: https://dashboard.render.com/blueprints/new?fromRepo=<repo>
+services:
+  - type: web
+    name: xauusd-terminal
+    runtime: node
+    plan: free        # 0.1 CPU / 512 MB RAM
+    region: oregon    # pick the region closest to you: oregon / frankfurt / singapore / ohio
+    buildCommand: npm ci && npm run build
+    startCommand: npm start  # concurrently runs server (API :4000) + web (Next on $PORT)
+    healthCheckPath: /api/status
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: API_PORT
+        value: "4000"
+      - key: API_URL
+        value: http://localhost:4000
+      # CORS is not exercised by the web UI (the Next proxy calls the API
+      # server-side), so this is informational only — set it to your real
+      # https://<app>.onrender.com URL once the service has a hostname.
+      - key: WEB_ORIGIN
+        value: http://localhost:3000
+      # Free-tier filesystem is ephemeral: settings.json lives in /tmp and
+      # resets on every redeploy/restart. AI provider keys survive because
+      # they are injected via env vars below, not written to data/.
+      - key: DATA_DIR
+        value: /tmp/xauusd-data
+      - key: REQUIRE_READ_KEY
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: PREWARM
+        value: "1"
+      # Secrets — provide real values in the Render dashboard after first deploy.
+      # API_KEY is required (the web proxy sends it on every /api request).
+      - key: API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
