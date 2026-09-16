@@ -15,7 +15,8 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 async function fetchRss(url: string, publisher: string, symbol: string | null): Promise<NewsItem[]> {
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
+  // Timeout guards cloud egress where a feed may hang rather than fail fast.
+  const res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(9_000) });
   if (!res.ok) throw new Error(`rss ${res.status} ${url}`);
   const xml = await res.text();
   const doc = parser.parse(xml);
@@ -40,6 +41,27 @@ export async function symbolNews(symbol: string): Promise<NewsItem[]> {
 export async function topNews(query = "stock market"): Promise<NewsItem[]> {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
   return fetchRss(url, "Google News", null);
+}
+
+/** Plain publisher feeds that tolerate datacenter/cloud egress (Google News
+ *  RSS is frequently geo-/captcha-gated from cloud IPs, so bias the fallback
+ *  toward these). All verified to return itemized RSS here. */
+export const RELIABLE_FEEDS: Array<{ url: string; publisher: string }> = [
+  { url: "https://www.cnbc.com/id/100003114/device/rss/rss.html", publisher: "CNBC" },
+  { url: "https://www.cnbc.com/id/20910258/device/rss/rss.html", publisher: "CNBC Markets" },
+  { url: "https://feeds.bbci.co.uk/news/business/rss.xml", publisher: "BBC Business" },
+  { url: "https://feeds.marketwatch.com/marketwatch/marketpulse/", publisher: "MarketWatch" },
+];
+
+/** Fetch several feeds in parallel, returning whatever succeeded. */
+export async function multiRss(
+  feeds: Array<{ url: string; publisher: string }>,
+  symbol: string | null = null
+): Promise<NewsItem[]> {
+  const results = await Promise.allSettled(feeds.map((f) => fetchRss(f.url, f.publisher, symbol)));
+  return results
+    .filter((r): r is PromiseFulfilledResult<NewsItem[]> => r.status === "fulfilled")
+    .flatMap((r) => r.value);
 }
 
 // ---- Geopolitics / safe-haven news ----

@@ -726,21 +726,25 @@ export function computeSessions(intraday: yahoo.Candle[], daily: yahoo.Candle[],
 
 /** Multi-day intraday from Yahoo, using the closest futures substitute when the
  *  spot pair itself has no Yahoo intraday series (XAUUSD → GC=F, XAGUSD → SI=F).
- *  Used for long timeframes (4h) a single Sina session can't cover. */
+ *  Used for long timeframes (4h) a single Sina session can't cover. Returns the
+ *  LONGEST candidate series — a short/truncated spot response must never win
+ *  over the richer futures tape (a short series yields too few 4h bars for the
+ *  structure model's ≥14-bar requirement). */
 async function yahooLongIntraday(symbol: string, range: string, interval: string): Promise<yahoo.Candle[]> {
   const fb = spotFallback(symbol);
   const candidates = fb && fb !== yahooSymbol(symbol) ? [yahooSymbol(symbol), fb] : [yahooSymbol(symbol)];
+  let longest: yahoo.Candle[] = [];
   let lastErr: unknown = new Error("yahoo intraday: no source");
   for (const cand of candidates) {
     try {
       const candles = await yahoo.history(cand, range, interval);
-      if (candles.length === 0) throw new Error("yahoo: empty intraday");
-      return candles;
+      if (candles.length > longest.length) longest = candles;
     } catch (err) {
       lastErr = err;
     }
   }
-  throw lastErr;
+  if (longest.length === 0) throw lastErr;
+  return longest;
 }
 
 /** History for spot metals / FX / futures: Sina intraday + daily first, then
@@ -754,8 +758,10 @@ async function metaHistory(symbol: string, spec: RangeSpec): Promise<yahoo.Candl
         // four-hour bars, far short of the ~14 required for structure.
         if (spec.interval === "60m") {
           try {
-            const bars = await tracked("yahoo", () => yahooLongIntraday(symbol, "3mo", "60m"));
-            if (bars.length >= 14) return spec.agg ? aggregate(bars, spec.agg) : bars;
+            // 6mo of hourly bars aggregates to a healthy 4h series (60 raw
+            // bars → ≥15 four-hour bars), even if the spot tape is spotty.
+            const bars = await tracked("yahoo", () => yahooLongIntraday(symbol, "6mo", "60m"));
+            if (bars.length >= 60) return spec.agg ? aggregate(bars, spec.agg) : bars;
           } catch {
             // fall through to the current-session minute line below
           }
@@ -877,21 +883,20 @@ marketRouter.get("/news", async (req, res) => {
 });
 
 async function buildGoldNews(symbol: string | null) {
+  const target = symbol ?? "XAUUSD";
+  const topic = target === "XAUUSD" ? "gold price" : symbol!;
   const queries = symbol
-    ? [
-        news.symbolNews(yahooSymbol(symbol)),
-        news.topNews(`${symbol === "XAUUSD" ? "gold price" : symbol} market`),
-      ]
+    ? [news.symbolNews(yahooSymbol(symbol)), news.topNews(`${topic} market`)]
     : [
-        news.topNews("gold price"),
+        news.symbolNews(yahooSymbol(target)),
+        news.topNews(`${topic} market`),
         news.topNews("gold market"),
         news.topNews("federal reserve gold dollar"),
+        news.multiRss(news.RELIABLE_FEEDS),
       ];
-  const lists = await Promise.allSettled(
-    queries.map((q) => tracked("news", () => q))
-  );
+  const lists = await Promise.allSettled(queries.map((q) => tracked("news", () => q)));
   const ok = lists.filter((r) => r.status === "fulfilled").map((r) => (r as any).value);
-  if (ok.length === 0) throw new Error("all news sources failed");
+  if (ok.length === 0) return []; // graceful empty feed (200) instead of a 502
   return news.dedupe(ok)
     .slice(0, 40)
     .map((n) => ({ ...n, impact: news.impactOf(n.title), sentiment: news.sentimentOf(n.title) }));
