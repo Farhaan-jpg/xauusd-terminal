@@ -13,7 +13,7 @@ services:
     runtime: node
     plan: free        # 0.1 CPU / 512 MB RAM
     region: oregon    # pick the region closest to you: oregon / frankfurt / singapore / ohio
-    buildCommand: npm ci && npm run build
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start  # concurrently runs server (API :4000) + web (Next on $PORT)
     healthCheckPath: /api/status
     autoDeploy: true

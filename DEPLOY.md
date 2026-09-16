@@ -43,8 +43,11 @@ Everything needed is already in the repo:
    `https://dashboard.render.com/blueprints/new?fromRepo=<YOUR_USER>/xauusd-terminal`
    — **New+ → Blueprint Instance** from the dashboard also auto-detects `render.yaml`.
 3. Render provisions the `xauusd-terminal` Web Service (free plan) and starts
-   the first deploy. Build = `npm ci && npm run build` (watch the logs — the
-   first build takes a few minutes). Start = `npm start` → API + web together.
+   the first deploy. Build = `npm ci --include=dev && npm run build` (the
+   `--include=dev` is required because Render sets `NODE_ENV=production` during
+   builds, which would otherwise make npm skip the TypeScript dev dependencies).
+   Watch the logs — the first build takes a few minutes. Start = `npm start` →
+   API + web together.
 4. Wait for the deploy to finish, then open `https://xauusd-terminal.onrender.com`
    (or whatever hostname Render assigned — it's shown on the service page).
 
