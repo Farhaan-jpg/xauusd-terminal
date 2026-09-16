@@ -21,6 +21,7 @@ import {
   computeBias,
   nextContracts,
 } from "../analytics.js";
+import type { OptionsSummary } from "../analytics.js";
 import { getTape } from "../tape.js";
 import { attachStream } from "../stream.js";
 
@@ -153,10 +154,9 @@ function withBudget<T>(p: Promise<T>, ms: number, fallback: () => T): Promise<T>
 }
 
 /** FedWatch-style rate probabilities. FRED reliably serves the current
- *  effective Fed Funds rate from any network; the 30-day Fed Funds futures
- *  (ZQ=F) only ships via Yahoo, which is geo-blocked on cloud VMs — so the
- *  futures leg is best-effort with a short retry, and the payload stays useful
- *  (current rate + FOMC countdown) even when that leg is unreachable. */
+ *  effective Fed Funds rate from any network. The 30-day Fed Funds futures
+ *  (ZQ=F) price is read from Yahoo's open v8 chart endpoint (no crumb), which
+ *  works from cloud VMs where the crumb-gated v7 quote API is geo-blocked. */
 async function buildRateProbs(): Promise<ReturnType<typeof computeRateProbs> & { note: string | null }> {
   const funded = await cached(`fred:FEDFUNDS`, FRED_TTL, () => tracked("fred", () => fred.latest("FEDFUNDS"))).catch(
     () => null
@@ -165,14 +165,51 @@ async function buildRateProbs(): Promise<ReturnType<typeof computeRateProbs> & {
   let zqPrice: number | null = null;
   for (let attempt = 0; attempt < 2 && zqPrice === null; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 1_500));
-    const zq = await getQuotes(["ZQ=F"]);
-    zqPrice = zq[0]?.price ?? null;
+    const zq = await cached(`yahoo:chart:ZQ=F`, 45_000, () => tracked("yahoo", () => yahoo.quoteFromChart("ZQ=F"))).catch(
+      () => null
+    );
+    zqPrice = zq?.price ?? null;
   }
   const impliedBp = zqPrice !== null ? (100 - zqPrice) * 100 : null;
   return {
     ...computeRateProbs(currentBp, impliedBp),
     note: impliedBp === null ? "ZQ=F futures feed unreachable — implied rate & probabilities unavailable" : null,
   };
+}
+
+/** Options summary with a durable fallback for cloud hosts: Yahoo's options
+ *  chain (crumb-gated) is geo-blocked on VMs, but the CBOE Gold Volatility
+ *  Index (FRED, GVZCLS) plus the COMEX gold quote (Sina) still give real
+ *  at-the-money vol and the underlying, so the widget shows live data instead
+ *  of an empty chain. */
+async function buildOptionsSummary(symbol: "GC=F" | string): Promise<OptionsSummary> {
+  // Preferred: the full Yahoo chain.
+  try {
+    const chain = await tracked("yahoo", () => yahoo.options(symbol));
+    const s = computeOptionsSummary(chain);
+    if (chain.calls.length > 0 || chain.puts.length > 0 || s.atmIv !== null) return s;
+    throw new Error("yahoo: empty chain for " + symbol);
+  } catch {
+    // Fallback: FRED GVZCLS (gold ATM vol) + Sina GC quote for the underlying.
+    const [gvz, gcQuote] = await Promise.all([
+      cached("fred:GVZCLS:5", 3_600_000, () => tracked("fred", () => fred.series("GVZCLS", 5))).catch(() => []),
+      getQuotes([symbol]),
+    ]);
+    const gvzPoint = (gvz as any[]).length ? (gvz as any[])[(gvz as any[]).length - 1] : null;
+    const avgIv = gvzPoint?.value !== undefined && gvzPoint?.value !== null ? gvzPoint.value / 100 : null;
+    return {
+      underlying: gcQuote[0]?.price ?? null,
+      expiry: null,
+      atmStrike: null,
+      atmIv: avgIv,
+      skewProxy: null,
+      putCallOiRatio: null,
+      maxOiStrike: null,
+      avgIv,
+      nCalls: 0,
+      nPuts: 0,
+    };
+  }
 }
 
 // ---- VIX: served from FRED (daily close) since it's an index, not a tradable
@@ -1192,18 +1229,7 @@ marketRouter.get("/options", async (req, res) => {
   const symbol = String(req.query.symbol ?? "GC=F").toUpperCase();
   try {
     const data = await withBudget(
-      cached(`options:${symbol}`, 60_000, async () => {
-        // Yahoo's options chain is rate-limited / geo-gated on cloud VMs; retry
-        // once with a pause since it does respond intermittently from there.
-        let chain: Awaited<ReturnType<typeof yahoo.options>>;
-        try {
-          chain = await tracked("yahoo", () => yahoo.options(symbol));
-        } catch {
-          await new Promise((r) => setTimeout(r, 2_000));
-          chain = await tracked("yahoo", () => yahoo.options(symbol));
-        }
-        return computeOptionsSummary(chain);
-      }),
+      cached(`options:${symbol}`, 60_000, () => buildOptionsSummary(symbol)),
       20_000,
       () => staleGet(`options:${symbol}`) ?? {
         underlying: null,
@@ -1395,18 +1421,7 @@ marketRouter.get("/market-bias", async (req, res) => {
             })
           ),
           settle(cached("econ-calendar", 300_000, () => tracked("forexfactory", () => econcalendar.weeklyEvents()))),
-          settle(
-            cached("options:GC=F", 60_000, async () => {
-              let chain: Awaited<ReturnType<typeof yahoo.options>>;
-              try {
-                chain = await tracked("yahoo", () => yahoo.options("GC=F"));
-              } catch {
-                await new Promise((r) => setTimeout(r, 2_000));
-                chain = await tracked("yahoo", () => yahoo.options("GC=F"));
-              }
-              return computeOptionsSummary(chain);
-            })
-          ),
+          settle(cached("options:GC=F", 60_000, () => buildOptionsSummary("GC=F"))),
           settle(
             cached("rate-probs", 60_000, () => buildRateProbs())
           ),

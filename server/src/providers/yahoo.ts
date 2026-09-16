@@ -37,7 +37,7 @@ function curlText(url: string, headers: Record<string, string>): Promise<string>
           const code = (stderr || "").match(/\b(429|401|403|404)\b/)?.[0];
           if (code === "429") {
             consecutive429s++;
-            cooldownUntil = Date.now() + Math.min(30_000 * consecutive429s, 5 * 60_000);
+            crumbCooldownUntil = Date.now() + Math.min(30_000 * consecutive429s, 5 * 60_000);
           }
           reject(new Error(`yahoo curl ${code ?? err.message} for ${url}`));
           return;
@@ -206,12 +206,18 @@ async function getSession(): Promise<{ cookie: string; crumb: string }> {
 // Global politeness limiter: max 2 concurrent Yahoo requests with a minimum
 // spacing between request starts, plus a cooldown window after a 429 (with
 // backoff on repeat offenses) so we fail fast and let the cache serve stale data.
+//
+// Cooldowns are split between crumb-gated endpoints (v7 quote/options — these
+// 401/429 from datacenter IPs where the crumb handshake fails) and the open
+// v8 /chart endpoints (which work fine from servers). A crumb failure never
+// blocks a chart request anymore — that coupling is what left ZQ/F implied
+// rates and charts blank on cloud hosts.
 const MAX_CONCURRENT = 2;
 const MIN_SPACING_MS = 150;
 let active = 0;
 let nextSlotAt = 0;
 const waiters: Array<() => void> = [];
-let cooldownUntil = 0;
+let crumbCooldownUntil = 0;
 let consecutive429s = 0;
 
 function sleep(ms: number): Promise<void> {
@@ -250,8 +256,10 @@ function release(): void {
 }
 
 async function yfetch(url: string, withCrumb = false): Promise<any> {
-  if (Date.now() < cooldownUntil) {
-    throw new Error("yahoo rate-limited (cooling down)");
+  // Only crumb-gated endpoints share the cooldown counter; chart requests
+  // (withCrumb=false) are never throttled by crumb failures.
+  if (withCrumb && Date.now() < crumbCooldownUntil) {
+    throw new Error("yahoo crumb rate-limited (cooling down)");
   }
   const headers: Record<string, string> = { "User-Agent": UA, Accept: "application/json" };
   let full = url;
@@ -279,7 +287,7 @@ async function yfetch(url: string, withCrumb = false): Promise<any> {
     if (!res.ok) {
       if (res.status === 429) {
         consecutive429s++;
-        cooldownUntil = Date.now() + Math.min(30_000 * consecutive429s, 5 * 60_000);
+        if (withCrumb) crumbCooldownUntil = Date.now() + Math.min(30_000 * consecutive429s, 5 * 60_000);
       }
       if (withCrumb && (res.status === 401 || res.status === 403)) session = null;
       throw new Error(`yahoo ${res.status} for ${url}`);
