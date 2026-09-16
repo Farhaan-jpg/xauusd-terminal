@@ -36,9 +36,11 @@ export default function OptionsWidget() {
         <Stat label="Calls" value={String(data?.nCalls ?? 0)} />
         <Stat label="Puts" value={String(data?.nPuts ?? 0)} />
       </div>
-      <div className="dim text-[10px] mt-1.5">
-        Skew is an OTM-call − OTM-put IV proxy (no delta model). A positive number = calls rich (fear of upside), negative = puts rich.
-      </div>
+      {data?.skewProxy !== null && data?.skewProxy !== undefined && (
+        <div className="dim text-[10px] mt-1.5">
+          Skew is an OTM-call − OTM-put IV proxy (no delta model). A positive number = calls rich (fear of upside), negative = puts rich.
+        </div>
+      )}
       {data && data.nCalls === 0 && data.nPuts === 0 && data.atmIv !== null && (
         <div className="dim text-[10px] mt-1">
           IV from the CBOE Gold Volatility Index (GVZ); full strike/OPI chain unavailable from this host.
