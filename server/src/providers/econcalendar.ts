@@ -18,10 +18,12 @@ export type EconEvent = {
 type FFRaw = { title: string; country: string; date: string; impact: string; forecast: string; previous: string };
 
 async function fetchWeek(which: "thisweek" | "nextweek"): Promise<FFRaw[]> {
-  // Forex Factory rate-limits bursty callers (429); retry with backoff so a
-  // transient rejection never blanks the session calendar / FOMC countdown.
+  // Forex Factory rate-limits bursty callers (429) and intermittently blocks
+  // datacenter IPs outright; retry direct with backoff, then fall back to the
+  // same endpoint via the Jina reader proxy (runs from cloud IPs FF serves),
+  // which is how ZQ=F/GC=F/bypass.yahoo calls keep working on Render.
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 1_500 * attempt));
     try {
       const res = await fetch(`https://nfs.faireconomy.media/ff_calendar_${which}.json`, {
@@ -34,7 +36,19 @@ async function fetchWeek(which: "thisweek" | "nextweek"): Promise<FFRaw[]> {
       lastErr = err;
     }
   }
-  throw lastErr ?? new Error(`forexfactory failed for ${which}`);
+  try {
+    const res = await fetch(`https://r.jina.ai/https://nfs.faireconomy.media/ff_calendar_${which}.json`, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) throw new Error(`forexfactory-via-proxy ${res.status} for ${which}`);
+    const text = await res.text();
+    const start = text.indexOf("[");
+    if (start < 0) throw new Error("forexfactory-via-proxy: no array in payload");
+    return JSON.parse(text.slice(start)) as FFRaw[];
+  } catch (err) {
+    throw lastErr ?? err;
+  }
 }
 
 type Matcher = {
