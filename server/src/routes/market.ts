@@ -10,6 +10,7 @@ import * as econcalendar from "../providers/econcalendar.js";
 import * as sina from "../providers/sina.js";
 import * as cnbc from "../providers/cnbc.js";
 import * as cot from "../providers/cot.js";
+import * as cme from "../providers/cme.js";
 import {
   computeStats,
   computeCorrelations,
@@ -257,11 +258,9 @@ async function buildRateProbs(): Promise<ReturnType<typeof computeRateProbs> & {
   };
 }
 
-/** Options summary with a durable fallback for cloud hosts: Yahoo's options
- *  chain (crumb-gated) is geo-blocked on VMs, but the CBOE Gold Volatility
- *  Index (FRED, GVZCLS) plus the COMEX gold quote (Sina) still give real
- *  at-the-money vol and the underlying, so the widget shows live data instead
- *  of an empty chain. */
+/** Options summary: Yahoo's full chain first, then the real GC=F strike chain
+ *  from CME for gold (Yahoo no longer serves futures options from any network),
+ *  then the durable GVZ/sina fallback for cloud hosts. */
 async function buildOptionsSummary(symbol: "GC=F" | string): Promise<OptionsSummary> {
   // Preferred: the full Yahoo chain.
   try {
@@ -270,6 +269,18 @@ async function buildOptionsSummary(symbol: "GC=F" | string): Promise<OptionsSumm
     if (chain.calls.length > 0 || chain.puts.length > 0 || s.atmIv !== null) return s;
     throw new Error("yahoo: empty chain for " + symbol);
   } catch {
+    // Gold COMEX options: CME serves the real strike chain (delayed). This is
+    // the only free, network-safe feed with actual GC option strikes + prices.
+    if (symbol.toUpperCase() === "GC=F") {
+      try {
+        const chain = await tracked("cme", () => cme.goldOptionsChain());
+        const s = computeOptionsSummary(chain);
+        if (chain.calls.length > 0 || chain.puts.length > 0 || s.atmIv !== null) return s;
+        throw new Error("cme: empty chain");
+      } catch {
+        // fall through to the GVZ fallback below
+      }
+    }
     // Fallback: FRED GVZCLS (gold ATM vol) + Sina GC quote for the underlying.
     const [gvz, gcQuote] = await Promise.all([
       cached("fred:GVZCLS:5", 3_600_000, () => tracked("fred", () => fred.series("GVZCLS", 5))).catch(() => []),
