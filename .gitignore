@@ -13,3 +13,4 @@ data/*.db*
 data/.api-key
 data/settings.json
 data/cache-stale.json
+data/cache-stale.json.tmp
