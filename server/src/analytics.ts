@@ -967,7 +967,7 @@ export function computeBias(x: BiasInput): BiasResult {
     } else if (x.rateProbs.expectedChangeBp !== null) {
       const eb = x.rateProbs.expectedChangeBp;
       const v = biasClamp(Math.round(-eb / 6), -5, 5);
-      push("macro", "Rate Odds", v, `expected ${pct(eb, 0)}bp`);
+      push("macro", "Rate Odds", v, `expected ${eb >= 0 ? "+" : ""}${eb}bp`);
     }
   }
   const vix = rate("VIXCLS");
@@ -1017,7 +1017,7 @@ export function computeBias(x: BiasInput): BiasResult {
     const pc = x.options.putCallOiRatio;
     if (sk !== null && sk !== 0) {
       const v = sk > 0 ? 3 : -3;
-      push("positioning", "Opt Skew", v, `calls${sk > 0 ? " bid" : " offered"} (${sk > 0 ? "+" : ""}${sk.toFixed(1)} IV%)`);
+      push("positioning", "Opt Skew", v, `calls${sk > 0 ? " bid" : " offered"} (${sk > 0 ? "+" : ""}${(sk * 100).toFixed(1)} IV%)`);
     }
     if (pc !== null && pc >= 1.5) {
       push("positioning", "P/C Ratio", -1, `${pc.toFixed(2)} heavy puts`);
@@ -1025,8 +1025,8 @@ export function computeBias(x: BiasInput): BiasResult {
     } else if (pc !== null && pc > 0) {
       push("positioning", "P/C Ratio", 0, `${pc.toFixed(2)}`);
     }
-    if (x.options.maxOiStrike !== null && x.options.atmIv !== null && x.options.atmIv >= 25) {
-      warnings.push(`HIGH IV atm ${x.options.atmIv.toFixed(0)}%`);
+    if (x.options.atmIv !== null && x.options.atmIv >= 0.25) {
+      warnings.push(`HIGH IV atm ${(x.options.atmIv * 100).toFixed(0)}%`);
     }
   }
   if (x.stats && x.stats.rv20 !== null) {
