@@ -39,6 +39,9 @@ export default function OptionsWidget() {
       <div className="dim text-[10px] mt-1.5">
         Skew is an OTM-call − OTM-put IV proxy (no delta model). A positive number = calls rich (fear of upside), negative = puts rich.
       </div>
+      {data && data.nCalls === 0 && data.nPuts === 0 && data.atmIv === null && (
+        <div className="down text-[10px] mt-1">Options chain temporarily unreachable — retrying…</div>
+      )}
     </div>
   );
 }

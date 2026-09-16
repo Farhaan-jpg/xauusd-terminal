@@ -18,11 +18,22 @@ export type EconEvent = {
 type FFRaw = { title: string; country: string; date: string; impact: string; forecast: string; previous: string };
 
 async function fetchWeek(which: "thisweek" | "nextweek"): Promise<FFRaw[]> {
-  const res = await fetch(`https://nfs.faireconomy.media/ff_calendar_${which}.json`, {
-    headers: { "User-Agent": "Mozilla/5.0" },
-  });
-  if (!res.ok) throw new Error(`forexfactory ${res.status} for ${which}`);
-  return res.json();
+  // Forex Factory rate-limits bursty callers (429); retry with backoff so a
+  // transient rejection never blanks the session calendar / FOMC countdown.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    try {
+      const res = await fetch(`https://nfs.faireconomy.media/ff_calendar_${which}.json`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (!res.ok) throw new Error(`forexfactory ${res.status} for ${which}`);
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr ?? new Error(`forexfactory failed for ${which}`);
 }
 
 type Matcher = {

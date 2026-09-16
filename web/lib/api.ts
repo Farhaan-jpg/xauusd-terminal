@@ -186,11 +186,12 @@ export type RateProbs = {
   currentRateBp: number | null;
   impliedRateBp: number | null;
   expectedChangeBp: number | null;
-  nextFomcAt: number;
+  nextFomcAt: number | null;
   nextFomcLabel: string;
   probHike25: number | null;
   probCut25: number | null;
   probHold: number | null;
+  note?: string | null;
 };
 
 export type EtfFlowSummary = {

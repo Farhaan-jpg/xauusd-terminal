@@ -16,6 +16,7 @@ const SHORT: Record<string, string> = {
   XAUUSD: "GOLD",
   "GC=F": "GC",
   "XAGUSD=X": "SIL",
+  "SI=F": "SILF",
   "DX-Y.NYB": "DXY",
   SPY: "SPX",
   TLT: "TLT",

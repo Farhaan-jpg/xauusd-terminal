@@ -121,6 +121,8 @@ const SINA_KLINE: Record<string, string> = {
   "XAUUSD=X": "XAU",
   XAGUSD: "XAG",
   "XAGUSD=X": "XAG",
+  "GC=F": "GC", // COMEX gold futures (Sina daily kline)
+  "SI=F": "SI", // COMEX silver futures (Sina daily kline)
 };
 
 /** Symbols Sina quotes (with recent-session high/low via its daily kline). */
@@ -143,7 +145,34 @@ function fail(req: any, res: any, err: unknown) {
  *  hold a desk route hostage. The underlying promise keeps running and seeds
  *  the cache, so the next request gets the full result. */
 function withBudget<T>(p: Promise<T>, ms: number, fallback: () => T): Promise<T> {
-  return Promise.race([p, new Promise<T>((resolve) => setTimeout(() => resolve(fallback()), ms))]);
+  // On rejection the race must still resolve with the fallback — previously an
+  // early throw beat the timeout, defeating the graceful-degrade pattern used
+  // by options / rate-probs / correlations on cloud networks.
+  const guarded = p.then((v) => v, () => fallback());
+  return Promise.race([guarded, new Promise<T>((resolve) => setTimeout(() => resolve(fallback()), ms))]);
+}
+
+/** FedWatch-style rate probabilities. FRED reliably serves the current
+ *  effective Fed Funds rate from any network; the 30-day Fed Funds futures
+ *  (ZQ=F) only ships via Yahoo, which is geo-blocked on cloud VMs — so the
+ *  futures leg is best-effort with a short retry, and the payload stays useful
+ *  (current rate + FOMC countdown) even when that leg is unreachable. */
+async function buildRateProbs(): Promise<ReturnType<typeof computeRateProbs> & { note: string | null }> {
+  const funded = await cached(`fred:FEDFUNDS`, FRED_TTL, () => tracked("fred", () => fred.latest("FEDFUNDS"))).catch(
+    () => null
+  );
+  const currentBp = funded?.value !== undefined && funded?.value !== null ? funded.value * 100 : null;
+  let zqPrice: number | null = null;
+  for (let attempt = 0; attempt < 2 && zqPrice === null; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_500));
+    const zq = await getQuotes(["ZQ=F"]);
+    zqPrice = zq[0]?.price ?? null;
+  }
+  const impliedBp = zqPrice !== null ? (100 - zqPrice) * 100 : null;
+  return {
+    ...computeRateProbs(currentBp, impliedBp),
+    note: impliedBp === null ? "ZQ=F futures feed unreachable — implied rate & probabilities unavailable" : null,
+  };
 }
 
 // ---- VIX: served from FRED (daily close) since it's an index, not a tradable
@@ -1162,10 +1191,33 @@ marketRouter.get("/futures-curve", async (req, res) => {
 marketRouter.get("/options", async (req, res) => {
   const symbol = String(req.query.symbol ?? "GC=F").toUpperCase();
   try {
-    const data = await cached(`options:${symbol}`, 60_000, async () => {
-      const chain = await tracked("yahoo", () => yahoo.options(symbol));
-      return computeOptionsSummary(chain);
-    });
+    const data = await withBudget(
+      cached(`options:${symbol}`, 60_000, async () => {
+        // Yahoo's options chain is rate-limited / geo-gated on cloud VMs; retry
+        // once with a pause since it does respond intermittently from there.
+        let chain: Awaited<ReturnType<typeof yahoo.options>>;
+        try {
+          chain = await tracked("yahoo", () => yahoo.options(symbol));
+        } catch {
+          await new Promise((r) => setTimeout(r, 2_000));
+          chain = await tracked("yahoo", () => yahoo.options(symbol));
+        }
+        return computeOptionsSummary(chain);
+      }),
+      20_000,
+      () => staleGet(`options:${symbol}`) ?? {
+        underlying: null,
+        expiry: null,
+        atmStrike: null,
+        atmIv: null,
+        skewProxy: null,
+        putCallOiRatio: null,
+        maxOiStrike: null,
+        avgIv: null,
+        nCalls: 0,
+        nPuts: 0,
+      }
+    );
     res.json(data);
   } catch (err) {
     fail(req, res, err);
@@ -1190,18 +1242,9 @@ marketRouter.get("/cot", async (req, res) => {
 marketRouter.get("/rate-probs", async (req, res) => {
   try {
     const data = await withBudget(
-      cached("rate-probs", 60_000, async () => {
-        const [funded, zq] = await Promise.all([
-          cached(`fred:FEDFUNDS`, FRED_TTL, () => tracked("fred", () => fred.latest("FEDFUNDS"))),
-          getQuotes(["ZQ=F"]),
-        ]);
-        const currentBp = funded?.value !== undefined && funded?.value !== null ? funded.value * 100 : null;
-        const zqPrice = zq[0]?.price ?? null;
-        const impliedBp = zqPrice !== null ? (100 - zqPrice) * 100 : null;
-        return computeRateProbs(currentBp, impliedBp);
-      }),
-      15_000,
-      () => staleGet("rate-probs") ?? computeRateProbs(null, null)
+      cached("rate-probs", 60_000, () => buildRateProbs()),
+      20_000,
+      () => staleGet("rate-probs") ?? { ...computeRateProbs(null, null), note: null }
     );
     res.json(data);
   } catch (err) {
@@ -1238,26 +1281,75 @@ marketRouter.get("/etf-flows", async (req, res) => {
 
 // ---- rolling 90-day correlation matrix across the gold complex ----
 
-const CORR_UNIVERSE = ["XAUUSD", "GC=F", "XAGUSD=X", "DX-Y.NYB", "SPY", "TLT", "GLD", "^VIX", "EURUSD=X"];
+const CORR_UNIVERSE = ["XAUUSD", "GC=F", "XAGUSD=X", "SI=F", "DX-Y.NYB", "EURUSD=X", "^VIX"];
+
+/** FRED daily series for correlation inputs that no free intraday feed carries
+ *  on a cloud VM (Yahoo/Stooq are geo-blocked there): the trade-weighted USD
+ *  index and EUR/USD both have FRED dailies. */
+const CORR_FRED: Record<string, string> = {
+  "DX-Y.NYB": "DTWEXBGS",
+  "EURUSD=X": "DEXUSEU",
+};
+
+/** Daily candle series for the correlation matrix. Prefers Sina klines for
+ *  metals, FRED dailies for FX / the USD index (both cloud-friendly), and VIX
+ *  from FRED's long window; the standard Yahoo→Stooq chain is the last resort.
+ *  Returns [] when nothing yields a usable series. */
+async function corrDailyFor(symbol: string): Promise<yahoo.Candle[]> {
+  const klineSym = SINA_KLINE[symbol];
+  if (klineSym) {
+    try {
+      const daily = await tracked("sina", () => sina.dailyHistory(klineSym));
+      if (daily.length > 30) return daily;
+    } catch {
+      // fall through to the next source
+    }
+  }
+  const fredId = CORR_FRED[symbol];
+  if (fredId) {
+    try {
+      const points = await tracked("fred", () => fred.series(fredId, 260));
+      if (points.length > 30) {
+        return points.map((p) => {
+          const time = Math.floor(new Date(p.date + "T00:00:00Z").getTime() / 1000);
+          return { time, open: p.value, high: p.value, low: p.value, close: p.value, volume: 0 };
+        });
+      }
+    } catch {
+      // fall through to the next source
+    }
+  }
+  if (isVix(symbol)) {
+    try {
+      const daily = await vixHistory("6M"); // long FRED window — "1D" only returns ~5 pts
+      if (daily.length > 30) return daily;
+    } catch {
+      // fall through to the next source
+    }
+  }
+  const via = await historyFor(symbol, "1D");
+  if (Array.isArray(via) && via.length > 30) return via;
+  return [];
+}
 
 marketRouter.get("/correlations", async (req, res) => {
   try {
     const data = await withBudget(
       cached("correlations", 300_000, async () => {
         const settled = await Promise.allSettled(
-          CORR_UNIVERSE.map((s) => cached(`history:${s}:1D`, HISTORY_TTL_LONG, () => historyFor(s, "1D")))
+          CORR_UNIVERSE.map((s) => cached(`corr:${s}:1D`, HISTORY_TTL_LONG, () => corrDailyFor(s)))
         );
         const series: Record<string, yahoo.Candle[]> = {};
         settled.forEach((r, i) => {
-          if (r.status === "fulfilled" && Array.isArray(r.value) && r.value.length > 90) {
+          if (r.status === "fulfilled" && Array.isArray(r.value) && r.value.length > 30) {
             series[CORR_UNIVERSE[i]] = r.value;
           }
         });
         if (Object.keys(series).length < 2) throw new Error("not enough daily lines for a correlation matrix");
-        return computeCorrelations(series, 90);
+        return computeCorrelations(series, 60);
       }),
       15_000,
-      () => staleGet("correlations") ?? computeCorrelations({}, 90)
+      () => staleGet("correlations") ?? computeCorrelations({}, 60)
     );
     res.json(data);
   } catch (err) {
@@ -1305,20 +1397,18 @@ marketRouter.get("/market-bias", async (req, res) => {
           settle(cached("econ-calendar", 300_000, () => tracked("forexfactory", () => econcalendar.weeklyEvents()))),
           settle(
             cached("options:GC=F", 60_000, async () => {
-              const chain = await tracked("yahoo", () => yahoo.options("GC=F"));
+              let chain: Awaited<ReturnType<typeof yahoo.options>>;
+              try {
+                chain = await tracked("yahoo", () => yahoo.options("GC=F"));
+              } catch {
+                await new Promise((r) => setTimeout(r, 2_000));
+                chain = await tracked("yahoo", () => yahoo.options("GC=F"));
+              }
               return computeOptionsSummary(chain);
             })
           ),
           settle(
-            cached("rate-probs", 60_000, async () => {
-              const [funded, zq] = await Promise.all([
-                cached(`fred:FEDFUNDS`, FRED_TTL, () => tracked("fred", () => fred.latest("FEDFUNDS"))),
-                getQuotes(["ZQ=F"]),
-              ]);
-              const currentBp = funded?.value !== undefined && funded?.value !== null ? funded.value * 100 : null;
-              const zqPrice = zq[0]?.price ?? null;
-              return computeRateProbs(currentBp, zqPrice !== null ? (100 - zqPrice) * 100 : null);
-            })
+            cached("rate-probs", 60_000, () => buildRateProbs())
           ),
           settle(
             cached(`etf-flow:GLD`, HISTORY_TTL_LONG, async () => {
@@ -1335,15 +1425,15 @@ marketRouter.get("/market-bias", async (req, res) => {
           settle(
             cached("correlations", 300_000, async () => {
               const settled = await Promise.allSettled(
-                CORR_UNIVERSE.map((s) => cached(`history:${s}:1D`, HISTORY_TTL_LONG, () => historyFor(s, "1D")))
+                CORR_UNIVERSE.map((s) => cached(`corr:${s}:1D`, HISTORY_TTL_LONG, () => corrDailyFor(s)))
               );
               const series: Record<string, yahoo.Candle[]> = {};
               settled.forEach((r, i) => {
-                if (r.status === "fulfilled" && Array.isArray(r.value) && r.value.length > 90) {
+                if (r.status === "fulfilled" && Array.isArray(r.value) && r.value.length > 30) {
                   series[CORR_UNIVERSE[i]] = r.value;
                 }
               });
-              return computeCorrelations(series, 90);
+              return computeCorrelations(series, 60);
             })
           ),
           settle(

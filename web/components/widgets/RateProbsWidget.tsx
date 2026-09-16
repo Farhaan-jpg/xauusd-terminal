@@ -53,6 +53,7 @@ export default function RateProbsWidget() {
       <div className="dim text-[10px] mt-1.5">
         Two-outcome model from front 30-day Fed Funds futures vs effective target, ~10bp spot vol.
       </div>
+      {data?.note && <div className="down text-[10px] mt-1">{data.note}</div>}
     </div>
   );
 }
