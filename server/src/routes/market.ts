@@ -1068,7 +1068,12 @@ marketRouter.get("/econ-calendar", async (req, res) => {
     const data = await cached("econ-calendar", 300_000, () => tracked("forexfactory", () => econcalendar.weeklyEvents()));
     res.json(data);
   } catch (err) {
-    fail(req, res, err);
+    const stale = staleGet("econ-calendar");
+    if (stale) {
+      res.json(stale);
+    } else {
+      fail(req, res, err);
+    }
   }
 });
 

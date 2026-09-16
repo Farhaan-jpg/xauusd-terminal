@@ -22,10 +22,11 @@ async function fetchWeek(which: "thisweek" | "nextweek"): Promise<FFRaw[]> {
   // transient rejection never blanks the session calendar / FOMC countdown.
   let lastErr: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_500 * attempt));
     try {
       const res = await fetch(`https://nfs.faireconomy.media/ff_calendar_${which}.json`, {
         headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) throw new Error(`forexfactory ${res.status} for ${which}`);
       return await res.json();
