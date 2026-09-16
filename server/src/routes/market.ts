@@ -153,23 +153,49 @@ function withBudget<T>(p: Promise<T>, ms: number, fallback: () => T): Promise<T>
   return Promise.race([guarded, new Promise<T>((resolve) => setTimeout(() => resolve(fallback()), ms))]);
 }
 
+/** 30-day Fed Funds futures (ZQ=F) price, three tiers so it works from every
+ *  host: the direct Yahoo v8 chart (no crumb — desktop/clean networks), then
+ *  the same endpoint via the Jina reader proxy (cloud VMs whose IP range Yahoo
+ *  blocks outright), then null. */
+async function zqFuturePrice(): Promise<number | null> {
+  try {
+    const q = await cached(`yahoo:chart:ZQ=F`, 45_000, () => tracked("yahoo", () => yahoo.quoteFromChart("ZQ=F"))).catch(
+      () => null
+    );
+    if (q?.price != null) return q.price;
+  } catch {
+    // fall through to proxy
+  }
+  try {
+    const viaProxy = await cached(`proxychart:ZQ=F`, 60_000, async () => {
+      const res = await fetch(
+        "https://r.jina.ai/https://query1.finance.yahoo.com/v8/finance/chart/ZQ%3dF?range=1d&interval=1d",
+        { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(12_000) }
+      );
+      if (!res.ok) throw new Error(`r.jina.ai ${res.status}`);
+      const text = await res.text();
+      const m = /"regularMarketPrice"\s*:\s*([\d.]+)/.exec(text);
+      if (!m) throw new Error("r.jina.ai: no price in chart payload");
+      return Number(m[1]);
+    }).catch(() => null);
+    if (viaProxy != null) return viaProxy;
+  } catch {
+    // fall through to null
+  }
+  return null;
+}
+
 /** FedWatch-style rate probabilities. FRED reliably serves the current
  *  effective Fed Funds rate from any network. The 30-day Fed Funds futures
- *  (ZQ=F) price is read from Yahoo's open v8 chart endpoint (no crumb), which
- *  works from cloud VMs where the crumb-gated v7 quote API is geo-blocked. */
+ *  (ZQ=F) price comes from zqFuturePrice(), which works on cloud VMs where
+ *  Yahoo's crumb-gated v7 quote API (and sometimes even its chart endpoint)
+ *  is blocked. */
 async function buildRateProbs(): Promise<ReturnType<typeof computeRateProbs> & { note: string | null }> {
   const funded = await cached(`fred:FEDFUNDS`, FRED_TTL, () => tracked("fred", () => fred.latest("FEDFUNDS"))).catch(
     () => null
   );
   const currentBp = funded?.value !== undefined && funded?.value !== null ? funded.value * 100 : null;
-  let zqPrice: number | null = null;
-  for (let attempt = 0; attempt < 2 && zqPrice === null; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_500));
-    const zq = await cached(`yahoo:chart:ZQ=F`, 45_000, () => tracked("yahoo", () => yahoo.quoteFromChart("ZQ=F"))).catch(
-      () => null
-    );
-    zqPrice = zq?.price ?? null;
-  }
+  const zqPrice = await zqFuturePrice();
   const impliedBp = zqPrice !== null ? (100 - zqPrice) * 100 : null;
   return {
     ...computeRateProbs(currentBp, impliedBp),
