@@ -185,6 +185,52 @@ async function zqFuturePrice(): Promise<number | null> {
   return null;
 }
 
+/** Fetch a single Yahoo v8 chart price through the Jina reader proxy. Used as a
+ *  last-resort tier in getQuotes() for symbols (futures, crypto) with no other
+ *  provider — the proxy runs from cloud IPs Yahoo does not block. Returns null
+ *  on any failure. */
+async function quoteFromChartViaProxy(yahooSymbol: string): Promise<yahoo.Quote | null> {
+  const enc = encodeURIComponent(yahooSymbol).replace(/%3D/g, "%3d");
+  const url = `https://r.jina.ai/https://query1.finance.yahoo.com/v8/finance/chart/${enc}?range=1d&interval=1d`;
+  const price = await cached(`proxychart:${yahooSymbol}`, 60_000, async () => {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(12_000) });
+    if (!res.ok) throw new Error(`r.jina.ai ${res.status}`);
+    const text = await res.text();
+    const m = /"regularMarketPrice"\s*:\s*([\d.]+)/.exec(text);
+    if (!m) throw new Error("r.jina.ai: no price in chart payload");
+    return Number(m[1]);
+  }).catch(() => null);
+  if (price == null) return null;
+  return {
+    symbol: yahooSymbol,
+    name: yahooSymbol,
+    price,
+    change: null,
+    changePercent: null,
+    open: null,
+    high: null,
+    low: null,
+    previousClose: null,
+    bid: null,
+    ask: null,
+    volume: null,
+    avgVolume: null,
+    marketCap: null,
+    pe: null,
+    eps: null,
+    dividendYield: null,
+    week52High: null,
+    week52Low: null,
+    beta: null,
+    sharesOutstanding: null,
+    currency: null,
+    exchange: null,
+    marketState: null,
+    time: null,
+    source: "proxy:yahoo",
+  };
+}
+
 /** FedWatch-style rate probabilities. FRED reliably serves the current
  *  effective Fed Funds rate from any network. The 30-day Fed Funds futures
  *  (ZQ=F) price comes from zqFuturePrice(), which works on cloud VMs where
@@ -542,6 +588,18 @@ export async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
     const results = await Promise.allSettled(remaining.map((s) => tracked("yahoo", () => yahoo.quoteFromChart(yahooSymbol(s)))));
     results.forEach((r, i) => {
       if (r.status === "fulfilled") fetched.set(remaining[i], { ...r.value, symbol: remaining[i] });
+    });
+    remaining = remaining.filter((s) => !fetched.has(s));
+  }
+
+  // Yahoo v8 chart via the Jina reader proxy: works from cloud VMs (Render
+  // etc.) where Yahoo blocks the direct request at the network layer.
+  if (remaining.length > 0) {
+    const results = await Promise.allSettled(
+      remaining.map((s) => tracked("yahoo", () => quoteFromChartViaProxy(yahooSymbol(s))))
+    );
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled" && r.value) fetched.set(remaining[i], { ...r.value, symbol: remaining[i], source: "proxy:yahoo" });
     });
     remaining = remaining.filter((s) => !fetched.has(s));
   }
