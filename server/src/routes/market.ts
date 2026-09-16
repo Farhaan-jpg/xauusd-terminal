@@ -185,35 +185,43 @@ async function zqFuturePrice(): Promise<number | null> {
   return null;
 }
 
-/** Fetch a single Yahoo v8 chart price through the Jina reader proxy. Used as a
+/** Fetch a single Yahoo v8 chart quote through the Jina reader proxy. Used as a
  *  last-resort tier in getQuotes() for symbols (futures, crypto) with no other
  *  provider — the proxy runs from cloud IPs Yahoo does not block. Returns null
- *  on any failure. */
+ *  on any failure. Params come from the same chart meta that quoteFromChart()
+ *  reads, so change/changePercent line up with the direct path. */
 async function quoteFromChartViaProxy(yahooSymbol: string): Promise<yahoo.Quote | null> {
   const enc = encodeURIComponent(yahooSymbol).replace(/%3D/g, "%3d");
   const url = `https://r.jina.ai/https://query1.finance.yahoo.com/v8/finance/chart/${enc}?range=1d&interval=1d`;
+  const num = (name: string, s: string): number | null => {
+    const m = new RegExp(`"${name}"\\s*:\\s*(-?[\\d.]+)`).exec(s);
+    return m ? Number(m[1]) : null;
+  };
   const price = await cached(`proxychart:${yahooSymbol}`, 60_000, async () => {
     const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(12_000) });
     if (!res.ok) throw new Error(`r.jina.ai ${res.status}`);
     const text = await res.text();
-    const m = /"regularMarketPrice"\s*:\s*([\d.]+)/.exec(text);
-    if (!m) throw new Error("r.jina.ai: no price in chart payload");
-    return Number(m[1]);
+    const p = num("regularMarketPrice", text);
+    if (p == null) throw new Error("r.jina.ai: no price in chart payload");
+    return { p, prev: num("chartPreviousClose", text) ?? num("previousClose", text), high: num("regularMarketDayHigh", text), low: num("regularMarketDayLow", text), vol: num("regularMarketVolume", text), name: (/"(?:longName|shortName)"\s*:\s*"([^"]+)"/.exec(text) ?? [])[1] ?? null };
   }).catch(() => null);
   if (price == null) return null;
+  const { p, prev, high, low, vol, name } = price;
+  const change = p !== null && prev !== null ? p - prev : null;
+  const changePercent = p !== null && prev !== null && prev !== 0 ? ((p - prev) / prev) * 100 : null;
   return {
     symbol: yahooSymbol,
-    name: yahooSymbol,
-    price,
-    change: null,
-    changePercent: null,
+    name,
+    price: p,
+    change,
+    changePercent,
     open: null,
-    high: null,
-    low: null,
-    previousClose: null,
+    high,
+    low,
+    previousClose: prev,
     bid: null,
     ask: null,
-    volume: null,
+    volume: vol,
     avgVolume: null,
     marketCap: null,
     pe: null,
