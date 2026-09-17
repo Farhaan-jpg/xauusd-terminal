@@ -21,11 +21,11 @@ export const AI_PROVIDERS = ["openrouter", "gemini", "groq", "nvidia", "anthropi
 export type AiProvider = (typeof AI_PROVIDERS)[number];
 
 export const AI_PROVIDER_LABELS: Record<AiProvider, string> = {
-  openrouter: "OpenRouter",
-  gemini: "Google Gemini",
-  groq: "Groq",
-  nvidia: "NVIDIA NIM",
-  anthropic: "Anthropic",
+  openrouter: "OpenRouter (Finance-tuned)",
+  gemini: "Google Gemini 2.0",
+  groq: "Groq (Llama 3.3 70B)",
+  nvidia: "NVIDIA Nemotron 3 Ultra",
+  anthropic: "Anthropic Claude 3.5 Sonnet",
 };
 
 export const AI_PROVIDER_MODELS: Record<AiProvider, string> = {
@@ -42,10 +42,20 @@ export const AI_PROVIDER_MODELS: Record<AiProvider, string> = {
  * from the currently available free tier (verified against live key endpoints).
  */
 export const AI_PROVIDER_CHAIN: Record<AiProvider, string[]> = {
-  openrouter: ["openrouter/free", "nex-agi/nex-n2.5-pro:free"],
-  gemini: ["gemini-3-flash-preview", "gemini-3.8-flash"],
-  groq: ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"],
-  nvidia: ["nvidia/nemotron-3-super-120b-a12b", "z-ai/glm-5.3-flash"],
+  // Finance-tuned / strong-reasoning models via OpenRouter (free tier)
+  openrouter: [
+    "deepseek/deepseek-r1:free",
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "openrouter/free"
+  ],
+  // Gemini 2.0 Flash has strong tool-use + reasoning for market data
+  gemini: ["gemini-2.0-flash-exp", "gemini-1.5-flash"],
+  // Groq: Llama 3.3 70B — excellent reasoning, fast inference
+  groq: ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"],
+  // NVIDIA Nemotron 3 Ultra — strong on numerical/analytical tasks
+  nvidia: ["nvidia/nemotron-3-ultra", "nvidia/nemotron-3-super-120b-a12b"],
+  // Anthropic: Sonnet 3.5 — best general reasoning
   anthropic: ["claude-3-5-sonnet-20241022"],
 };
 

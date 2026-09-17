@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { analyzeSentiment, type SentimentResult } from "./finbert.js";
 
 export type NewsItem = {
   title: string;
@@ -15,14 +16,13 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 async function fetchRss(url: string, publisher: string, symbol: string | null): Promise<NewsItem[]> {
-  // Timeout guards cloud egress where a feed may hang rather than fail fast.
   const res = await fetch(url, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(9_000) });
   if (!res.ok) throw new Error(`rss ${res.status} ${url}`);
   const xml = await res.text();
   const doc = parser.parse(xml);
   const items = doc?.rss?.channel?.item ?? [];
   const list = Array.isArray(items) ? items : [items];
-  return list
+  const base = list
     .filter((i: any) => i?.title && i?.link)
     .map((i: any) => ({
       title: String(i.title),
@@ -31,6 +31,10 @@ async function fetchRss(url: string, publisher: string, symbol: string | null): 
       publishedAt: i.pubDate ? new Date(i.pubDate).toISOString() : null,
       symbol,
     }));
+  // Enrich with FinBERT sentiment (batched for efficiency)
+  const headlines = base.map((n) => n.title);
+  const sentiments = await analyzeSentiment(headlines);
+  return base.map((n, i) => ({ ...n, sentiment: sentiments[i].label }));
 }
 
 export async function symbolNews(symbol: string): Promise<NewsItem[]> {
@@ -157,9 +161,12 @@ export async function geopoliticsNews(): Promise<NewsItem[]> {
     .flatMap((r) => r.value);
   // keep only geopolitically relevant items (avoids generic "market" noise)
   const filtered = items.filter((n) => GEO_KEYWORDS.test(n.title));
+  // Enrich with FinBERT sentiment
+  const headlines = filtered.map((n) => n.title);
+  const sentiments = await analyzeSentiment(headlines);
   return dedupe([filtered])
     .slice(0, 40)
-    .map((n) => ({ ...n, impact: impactOf(n.title), sentiment: sentimentOf(n.title) }));
+    .map((n, i) => ({ ...n, impact: impactOf(n.title), sentiment: sentiments[i].label }));
 }
 
 /** Merge, de-duplicate by normalized title, newest first. */
