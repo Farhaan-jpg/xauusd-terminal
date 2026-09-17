@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { chatWithFallback } from "../providers/llm.js";
 import { getSettings } from "../settings.js";
+import { runAgent, runAgents, getAgents, getAgent, clearAgentCache, getCacheStats, warmupModels, type AgentInput } from "../agent-runner.js";
+import { getLlamaManager, type LocalModelId, MODEL_SPECS, RECOMMENDED_COMBOS } from "../local-llama.js";
 
 export const aiRouter = Router();
 
@@ -35,5 +37,122 @@ aiRouter.post("/chat", async (req, res) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(502).json({ error: msg });
+  }
+});
+
+// Local AI agent endpoints
+aiRouter.get("/agents", (_req, res) => {
+  res.json({ agents: getAgents() });
+});
+
+aiRouter.get("/agents/:id", (req, res) => {
+  const agent = getAgent(req.params.id);
+  if (!agent) return res.status(404).json({ error: "Agent not found" });
+  res.json(agent);
+});
+
+aiRouter.post("/agents/run", async (req, res) => {
+  const input = req.body as AgentInput;
+  if (!input?.agentId || !input?.input) {
+    return res.status(400).json({ error: "agentId and input required" });
+  }
+  try {
+    const result = await runAgent(input);
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+aiRouter.post("/agents/batch", async (req, res) => {
+  const inputs = req.body as AgentInput[];
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return res.status(400).json({ error: "inputs array required" });
+  }
+  try {
+    const results = await runAgents(inputs);
+    res.json({ results });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+aiRouter.post("/cache/clear", (_req, res) => {
+  clearAgentCache();
+  res.json({ ok: true });
+});
+
+aiRouter.get("/cache/stats", (_req, res) => {
+  res.json(getCacheStats());
+});
+
+// Local llama.cpp management
+aiRouter.get("/local/models", (_req, res) => {
+  res.json({ models: MODEL_SPECS, recommended: RECOMMENDED_COMBOS });
+});
+
+aiRouter.get("/local/status", async (_req, res) => {
+  try {
+    const manager = getLlamaManager();
+    const status = manager.getStatus();
+    res.json(status);
+  } catch (err) {
+    res.json({ server: false, slots: [], error: String(err) });
+  }
+});
+
+aiRouter.post("/local/start", async (_req, res) => {
+  try {
+    const manager = getLlamaManager();
+    await manager.start();
+    res.json({ ok: true, status: manager.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+aiRouter.post("/local/stop", async (_req, res) => {
+  const manager = getLlamaManager();
+  manager.stop();
+  res.json({ ok: true });
+});
+
+aiRouter.post("/local/models/:id/download", async (req, res) => {
+  try {
+    const manager = getLlamaManager();
+    const modelId = req.params.id as LocalModelId;
+    if (!MODEL_SPECS[modelId]) {
+      return res.status(404).json({ error: "Unknown model" });
+    }
+    const path = await manager.downloadModel(modelId);
+    res.json({ ok: true, path });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+aiRouter.post("/local/models/:id/load", async (req, res) => {
+  try {
+    const manager = getLlamaManager();
+    const modelId = req.params.id as LocalModelId;
+    if (!MODEL_SPECS[modelId]) {
+      return res.status(404).json({ error: "Unknown model" });
+    }
+    const slot = await manager.ensureModel(modelId);
+    res.json({ ok: true, slot, status: manager.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+aiRouter.post("/local/warmup", async (req, res) => {
+  try {
+    const models = (req.body?.models as LocalModelId[]) ?? RECOMMENDED_COMBOS[0];
+    await warmupModels(models);
+    res.json({ ok: true, models });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
   }
 });

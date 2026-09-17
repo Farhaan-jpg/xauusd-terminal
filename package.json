@@ -1,7 +1,10 @@
 {
   "name": "xauusd-terminal",
   "private": true,
-  "workspaces": ["server", "web"],
+  "workspaces": [
+    "server",
+    "web"
+  ],
   "engines": {
     "node": ">=20.9.0"
   },
@@ -17,5 +20,8 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "undici": "^8.10.2"
   }
 }
