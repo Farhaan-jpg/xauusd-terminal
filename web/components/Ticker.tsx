@@ -7,9 +7,9 @@ import { useTerminal } from "../store/terminal";
 type Market = {
   symbol: string;
   label: string;
-  price: number;
-  change: number;
-  changePercent: number;
+  price: number | null;
+  change: number | null;
+  changePercent: number | null;
 };
 
 function MarketItem({ m }: { m: Market }) {

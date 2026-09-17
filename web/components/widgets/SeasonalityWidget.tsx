@@ -68,7 +68,10 @@ export default function SeasonalityWidget() {
       </table>
       {best && hasStats && (
         <div className="dim mt-1.5 text-[10px]">
-          Best calendar month historically: <span className="up">{best.label} (+{fmt(best.avgPct)}% avg, {Math.round(best.winRate * 100)}% of years)</span>
+          Best calendar month historically:{" "}
+          <span className={best.avgPct >= 0 ? "up" : "down"}>
+            {best.label} ({best.avgPct >= 0 ? "+" : ""}{fmt(best.avgPct)}% avg, {Math.round(best.winRate * 100)}% of years)
+          </span>
         </div>
       )}
     </div>

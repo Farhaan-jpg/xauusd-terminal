@@ -40,9 +40,21 @@ export async function history(symbol: string): Promise<Candle[]> {
   for (const line of lines.slice(1)) {
     const [date, open, high, low, close, volume] = line.split(",");
     const t = Date.parse(date + "T00:00:00Z") / 1000;
-    const [o, h, l, c] = [+open, +high, +low, +close];
+    const c = +close;
     if (!isFinite(t) || !isFinite(c)) continue;
-    candles.push({ time: t, open: o, high: h, low: l, close: c, volume: +volume || 0 });
+    // Stooq emits "N/D" for missing intraday fields on some instruments — a NaN
+    // open/high/low would poison the chart, so fall back to the close.
+    const o = +open;
+    const h = +high;
+    const l = +low;
+    candles.push({
+      time: t,
+      open: isFinite(o) ? o : c,
+      high: isFinite(h) ? h : c,
+      low: isFinite(l) ? l : c,
+      close: c,
+      volume: +volume || 0,
+    });
   }
   return candles;
 }
@@ -57,19 +69,25 @@ export async function quote(symbol: string): Promise<Quote> {
   const [ticker, , , open, high, low, close, volume] = lines[1].split(",");
   const price = +close;
   if (!isFinite(price)) throw new Error("stooq: no quote for " + sym);
+  // "N/D" in any of these must become null, not NaN/0 — and a legitimate 0
+  // (e.g. a volume print) must not be coerced away by `|| null`.
+  const numOrNull = (s: string | undefined): number | null => {
+    const v = Number(s);
+    return Number.isFinite(v) ? v : null;
+  };
   return {
     symbol: symbol.toUpperCase(),
     name: ticker,
     price,
     change: null,
     changePercent: null,
-    open: +open || null,
-    high: +high || null,
-    low: +low || null,
+    open: numOrNull(open),
+    high: numOrNull(high),
+    low: numOrNull(low),
     previousClose: null,
     bid: null,
     ask: null,
-    volume: +volume || null,
+    volume: numOrNull(volume),
     avgVolume: null,
     marketCap: null,
     pe: null,

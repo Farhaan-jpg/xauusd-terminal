@@ -1,13 +1,9 @@
-// Server-side alert notifier. When the user configures a webhook URL
-// (Settings → Alerts), the running terminal polls quotes / calendar / news and
-// POSTs alert payloads to that URL — so alerts keep firing even while the app
-// window is closed or on another machine. Fire-and-forget: nothing here ever
-// throws into the request path.
-import { getSettings, type AlertSettings } from "./settings.js";
-import { cached } from "./cache.js";
-import { tracked } from "./providers/registry.js";
-import { getQuotes } from "./routes/market.js";
-import { topNews, dedupe, type NewsItem } from "./providers/news.js";
+// Alert rule engine. The rules themselves are pure and live here (unit-tested
+// in notify.test.ts). The stream engine (stream.ts) is the single evaluator —
+// it calls evaluateRules on its 5s cadence and delivers the fired alerts to
+// every sink (SSE clients + the optional webhook), so a level-crossing can
+// never double-fire or be missed because two loops raced on shared state.
+import type { AlertSettings } from "./settings.js";
 import type { EconEvent } from "./providers/econcalendar.js";
 
 export type NotifyEvent = {
@@ -21,7 +17,6 @@ export type NotifyEvent = {
 // re-armed only once price returns to the safe side of the trigger.
 const armed = new Map<string, boolean>();
 const fired = new Map<string, number>();
-let prevSpot: { price: number; at: number } | null = null;
 
 function setFired(key: string, now: number, cooldownMs: number): boolean {
   const last = fired.get(key) ?? 0;
@@ -105,90 +100,4 @@ export function evaluateRules(params: {
   }
 
   return out;
-}
-
-async function currentPrices(symbols: string[]): Promise<Map<string, number | null>> {
-  const map = new Map<string, number | null>();
-  if (symbols.length === 0) return map;
-  try {
-    const quotes = await getQuotes([...new Set(symbols)]);
-    for (const q of quotes) map.set(q.symbol, q.price ?? null);
-  } catch {
-    // partial data is still useful; missing symbols just never fire
-  }
-  return map;
-}
-
-async function currentHeadlines(): Promise<string[]> {
-  try {
-    const lists = await Promise.allSettled([
-      tracked("news", () => topNews("gold price")),
-    ]);
-    const ok = lists.filter((r) => r.status === "fulfilled").map((r) => (r as any).value) as NewsItem[][];
-    return dedupe(ok).slice(0, 40).map((n) => n.title).filter((t): t is string => typeof t === "string");
-  } catch {
-    return [];
-  }
-}
-
-function post(url: string, ev: NotifyEvent): Promise<boolean> {
-  return fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ type: ev.type, text: ev.text, tone: ev.tone, at: new Date().toISOString() }),
-    signal: AbortSignal.timeout(5_000),
-  })
-    .then((r) => r.ok)
-    .catch((err) => {
-      console.error(`[notify] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
-      return false;
-    });
-}
-
-let lastMoveKeyAt = 0;
-
-async function tick(): Promise<void> {
-  const { alerts } = getSettings();
-  const url = alerts.webhook?.url?.trim();
-  if (!alerts.enabled || !alerts.webhook?.enabled || !url) return;
-
-  const symbols = ["XAUUSD", ...(alerts.levels ?? []).map((l) => l.symbol)];
-  const [prices, events, headlines] = await Promise.all([
-    currentPrices(symbols),
-    cached("econ-calendar", 300_000, () => tracked("forexfactory", () => import("./providers/econcalendar.js").then((m) => m.weeklyEvents()))).catch(() => [] as EconEvent[]),
-    currentHeadlines(),
-  ]);
-
-  // Spot-move detection: percent change of XAUUSD between consecutive polls.
-  const spot = prices.get("XAUUSD");
-  const now = Date.now();
-  if (spot !== undefined && spot !== null && Number.isFinite(spot) && prevSpot) {
-    const pct = Math.abs((spot / prevSpot.price - 1) * 100);
-    if (pct >= alerts.thresholdPct && now - lastMoveKeyAt > 10 * 60_000) {
-      lastMoveKeyAt = now;
-      const dir = spot > prevSpot.price ? "up" : "down";
-      const ev: NotifyEvent = {
-        type: "move",
-        tone: dir === "up" ? "up" : "down",
-        text: `Gold ${dir} ${pct.toFixed(2)}% in the last ${Math.round((now - prevSpot.at) / 1000)}s → ${spot.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
-        key: `mv:${Math.floor(now / 600_000)}`,
-      };
-      await post(url, ev);
-    }
-  }
-  if (spot !== undefined && spot !== null && Number.isFinite(spot)) {
-    prevSpot = { price: spot, at: now };
-  }
-
-  const firedNow = evaluateRules({ now, alerts, prices, events, headlines });
-  await Promise.allSettled(firedNow.map((ev) => post(url, ev)));
-}
-
-export function startNotifier(): NodeJS.Timeout | null {
-  const timer = setInterval(() => {
-    void tick();
-  }, 30_000);
-  timer.unref();
-  void tick(); // first evaluation immediately
-  return timer;
 }

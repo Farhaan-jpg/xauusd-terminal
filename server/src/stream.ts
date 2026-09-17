@@ -4,9 +4,12 @@
 // rule engine are also pushed instantly to the browser instead of only hitting
 // the webhook. No provider calls happen here — it is a cache reader.
 import { cacheGet } from "./cache.js";
+import { cached } from "./cache.js";
 import { getSettings } from "./settings.js";
 import { evaluateRules, type NotifyEvent } from "./notify.js";
 import { recordTapeTick } from "./tape.js";
+import { tracked } from "./providers/registry.js";
+import { weeklyEvents } from "./providers/econcalendar.js";
 import type { Quote } from "./providers/yahoo.js";
 import type { NewsItem } from "./providers/news.js";
 import type { EconEvent } from "./providers/econcalendar.js";
@@ -37,7 +40,9 @@ export function subscriberCount(): number {
 }
 
 function broadcast(msg: StreamMessage): void {
-  lastTick = msg;
+  // Only tick frames are replayed to newly-connected clients; alerts are live
+  // events and must not replay on every reconnect/refresh.
+  if (msg.type === "tick") lastTick = msg;
   for (const fn of listeners) {
     try {
       fn(msg);
@@ -47,7 +52,32 @@ function broadcast(msg: StreamMessage): void {
   }
 }
 
-// ---- alert push (rule evaluation on a 5s cadence, reusing notify.ts logic) ----
+// ---- alert push (single evaluator: rules + move detection → SSE + webhook) ----
+
+let prevSpot: { price: number; at: number } | null = null;
+let lastMoveAt = 0;
+
+function postWebhook(url: string, ev: NotifyEvent): void {
+  void fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: ev.type, text: ev.text, tone: ev.tone, at: new Date().toISOString() }),
+    signal: AbortSignal.timeout(5_000),
+  })
+    .then((r) => {
+      if (!r.ok) console.error(`[stream] webhook ${r.status}`);
+    })
+    .catch((err) => {
+      console.error(`[stream] webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+}
+
+function deliver(ev: NotifyEvent): void {
+  broadcast({ type: "alert", ts: Date.now(), alert: ev });
+  const { alerts } = getSettings();
+  const url = alerts.webhook?.url?.trim();
+  if (alerts.enabled && alerts.webhook?.enabled && url) postWebhook(url, ev);
+}
 
 async function evaluateAndPushAlerts(): Promise<void> {
   const { alerts } = getSettings();
@@ -57,32 +87,45 @@ async function evaluateAndPushAlerts(): Promise<void> {
     const q = cacheGet<Quote>(`quote:${sym}`);
     prices.set(sym, q?.price ?? null);
   }
-  const events = (await cachedEvents()).filter((e) => e && /\S/.test(e.date));
-  const headlines = cachedHeadlines();
-  const fired = evaluateRules({ now: Date.now(), alerts, prices, events, headlines });
-  for (const alert of fired) broadcast({ type: "alert", ts: Date.now(), alert });
-}
 
-let eventsCache: EconEvent[] = [];
-let eventsAt = 0;
-async function cachedEvents(): Promise<EconEvent[]> {
-  if (eventsCache.length === 0 || Date.now() - eventsAt > 300_000) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${process.env.API_PORT ?? 4000}/api/econ-calendar`, {
-        signal: AbortSignal.timeout(15_000),
+  // Spot-move detection between consecutive evaluations (server-side so the
+  // webhook and the browser get the exact same move event, once).
+  const now = Date.now();
+  const spot = prices.get("XAUUSD");
+  if (spot !== undefined && spot !== null && Number.isFinite(spot) && prevSpot) {
+    const pct = Math.abs((spot / prevSpot.price - 1) * 100);
+    const threshold = Number.isFinite(alerts.thresholdPct) ? alerts.thresholdPct : 0.5;
+    if (pct >= threshold && now - lastMoveAt > 10 * 60_000) {
+      lastMoveAt = now;
+      const dir = spot > prevSpot.price ? "up" : "down";
+      deliver({
+        type: "move",
+        tone: dir === "up" ? "up" : "down",
+        text: `Gold ${dir} ${pct.toFixed(2)}% in the last ${Math.round((now - prevSpot.at) / 1000)}s → ${spot.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+        key: `mv:${Math.floor(now / 600_000)}`,
       });
-      if (res.ok) {
-        const json = (await res.json()) as EconEvent[];
-        if (Array.isArray(json)) {
-          eventsCache = json;
-          eventsAt = Date.now();
-        }
-      }
-    } catch {
-      // keep last-known events
     }
   }
-  return eventsCache;
+  if (spot !== undefined && spot !== null && Number.isFinite(spot)) {
+    prevSpot = { price: spot, at: now };
+  }
+
+  const events = (await cachedEvents()).filter((e) => e && /\S/.test(e.date));
+  const headlines = cachedHeadlines();
+  const fired = evaluateRules({ now, alerts, prices, events, headlines });
+  for (const alert of fired) deliver(alert);
+}
+
+/** Same cache key + loader as GET /api/econ-calendar, so the stream's 5s
+ *  cadence shares the route's fetch (single-flight) and never self-HTTPs the
+ *  API — which broke under REQUIRE_READ_KEY and misread API_PORT. */
+async function cachedEvents(): Promise<EconEvent[]> {
+  try {
+    const list = await cached("econ-calendar", 300_000, () => tracked("forexfactory", () => weeklyEvents()));
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
 }
 
 function cachedHeadlines(): string[] {
@@ -95,6 +138,10 @@ function cachedHeadlines(): string[] {
 
 let engineTimer: NodeJS.Timeout | null = null;
 let tickCount = 0;
+// Last known tick per symbol. The quote cache has a 1s TTL, so a poll landing
+// right on the boundary would otherwise flap a known price to null and blank
+// the live strip; hold the previous value until a fresh quote arrives.
+const lastTicks: TickMap = {};
 
 function engineTick(): void {
   const ts = Date.now();
@@ -102,7 +149,9 @@ function engineTick(): void {
   for (const sym of WATCH) {
     const q = cacheGet<Quote>(`quote:${sym}`);
     if (q) {
-      ticks[sym] = { price: q.price, changePercent: q.changePercent, t: q.time ?? null };
+      const t = { price: q.price, changePercent: q.changePercent, t: q.time ?? null };
+      ticks[sym] = t;
+      lastTicks[sym] = t;
       if (q.price !== null && Number.isFinite(q.price)) {
         recordTapeTick(sym, {
           t: (q.time && Number.isFinite(q.time) ? q.time * 1000 : ts),
@@ -113,7 +162,7 @@ function engineTick(): void {
         });
       }
     } else {
-      ticks[sym] = { price: null, changePercent: null, t: null };
+      ticks[sym] = lastTicks[sym] ?? { price: null, changePercent: null, t: null };
     }
   }
   broadcast({ type: "tick", ts, ticks });
@@ -152,23 +201,41 @@ export function attachStream(router: Router): void {
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     });
-    res.write("retry: 3000\n\n");
-    if (lastTick) res.write(`data: ${JSON.stringify(lastTick)}\n\n`);
+
+    // Guarded write: once the socket is torn down (client navigated away, proxy
+    // dropped it) a raw res.write() can throw or emit an unhandled 'error' and
+    // take the whole process down. Swallow writes to a dead socket instead.
+    const send = (chunk: string) => {
+      if (res.writableEnded || res.destroyed) return;
+      try {
+        res.write(chunk);
+      } catch {
+        // socket died mid-write; cleanup runs via the close/error handlers below
+      }
+    };
+
+    send("retry: 3000\n\n");
+    if (lastTick) send(`data: ${JSON.stringify(lastTick)}\n\n`);
+
     const unsub = subscribe((msg) => {
-      res.write(`data: ${JSON.stringify(msg)}\n\n`);
+      send(`data: ${JSON.stringify(msg)}\n\n`);
     });
-    const hb = setInterval(() => {
-      res.write(`: hb ${Date.now()}\n\n`);
-    }, 20_000);
+    const hb = setInterval(() => send(`: hb ${Date.now()}\n\n`), 20_000);
     hb.unref?.();
-    req.on("close", () => {
+
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
       clearInterval(hb);
       unsub();
-    });
-    req.on("error", () => {
-      clearInterval(hb);
-      unsub();
-    });
+    };
+    // 'close' on either side + an explicit res error handler: a vanished client
+    // must never leak the heartbeat interval or leave an unhandled socket error.
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
   });
 }
 

@@ -16,7 +16,7 @@ export default function TapeWidget() {
     <div className="p-2 text-[11px]">
       <div className="flex items-center gap-3 flex-wrap mb-1.5">
         <span className="text-[15px] font-bold tabular-nums">{fmt(quote?.price)}</span>
-        <span className={fmt(quote?.changePercent, 2).startsWith("-") ? "down" : "up"}>
+        <span className={quote?.changePercent === null || quote?.changePercent === undefined ? "dim" : quote.changePercent >= 0 ? "up" : "down"}>
           {quote?.changePercent !== null && quote?.changePercent !== undefined
             ? `${quote.changePercent >= 0 ? "+" : ""}${fmt(quote.changePercent, 2)}%`
             : ""}

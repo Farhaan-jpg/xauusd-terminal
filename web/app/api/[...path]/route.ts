@@ -6,7 +6,7 @@ import { getApiKey } from "@/lib/api-key";
 // must never reach the browser, only travel server-to-server.
 const API_URL = process.env.API_URL ?? "http://localhost:4000";
 
-async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
+async function proxy(req: NextRequest, path: string[]): Promise<Response> {
   const url = `${API_URL}/api/${path.join("/")}${req.nextUrl.search}`;
   const apiKey = getApiKey();
 
@@ -27,6 +27,22 @@ async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
     body: hasBody ? await req.text() : undefined,
     cache: "no-store",
   });
+
+  // Server-Sent Events must stream through unbuffered. Buffering the body with
+  // arrayBuffer() would hang this request forever on a never-ending feed, so
+  // hand the raw upstream stream straight back to the browser.
+  const upstreamType = upstream.headers.get("content-type") ?? "";
+  if (upstreamType.includes("text/event-stream") && upstream.body) {
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
 
   const body = upstream.status === 204 ? null : await upstream.arrayBuffer();
   return new NextResponse(body, {

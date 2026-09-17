@@ -56,14 +56,26 @@ export async function quote(symbol: string, displayName: string, displaySymbol: 
 
   const price = n(q.last);
   const prev = n(q.prev_close);
-  const change = q.changetype === "DOWN" ? -Math.abs(n(q.change) ?? 0) : n(q.change);
+  const reported = n(q.change);
+  // Derive from price − prev when both are present (same feed, always
+  // consistent); otherwise take the reported magnitude and apply the direction
+  // from changetype. Never emit -0.
+  const raw =
+    price !== null && prev !== null && price - prev !== 0
+      ? price - prev
+      : reported !== null
+        ? Math.abs(reported) * (q.changetype === "DOWN" ? -1 : 1)
+        : null;
+  const change = raw === 0 ? 0 : raw;
+  const changePercent =
+    price !== null && prev !== null && prev !== 0 ? ((price - prev) / prev) * 100 : (n(q.changepct) === 0 ? 0 : n(q.changepct));
 
   return {
     symbol: displaySymbol,
     name: q.name ?? displayName,
     price,
-    change: change ?? (price !== null && prev !== null ? price - prev : null),
-    changePercent: n(q.changepct),
+    change,
+    changePercent,
     open: n(q.open),
     high: n(q.high) ?? n(q.high52) ?? price,
     low: n(q.low) ?? n(q.low52) ?? price,

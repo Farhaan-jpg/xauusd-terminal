@@ -37,6 +37,19 @@ const money = (s: unknown): number | null => {
   return isFinite(n) ? n : null;
 };
 
+// Nasdaq volume arrives as "5,234,567" but can be abbreviated ("12.3M") on some
+// rows; the old `.split(".")[0]` turned the latter into 12.
+const parseVolume = (s: unknown): number | null => {
+  if (typeof s !== "string") return null;
+  const m = /^([\d,.]+)\s*([KMB])?$/i.exec(s.trim());
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  if (!isFinite(n)) return null;
+  const suffix = (m[2] ?? "").toUpperCase();
+  const mult = suffix === "K" ? 1e3 : suffix === "M" ? 1e6 : suffix === "B" ? 1e9 : 1;
+  return n * mult;
+};
+
 function assetClassOf(symbol: string): "stocks" | "etf" {
   // Heuristic: most well-known ETF tickers used across the app; falls back to "stocks".
   const etfs = new Set(["SPY", "DIA", "QQQ", "GLD", "USO", "UUP", "IWM", "VTI", "TLT"]);
@@ -76,7 +89,7 @@ export async function quote(symbol: string): Promise<Quote> {
     previousClose: prevClose,
     bid: money(info.primaryData?.bidPrice),
     ask: money(info.primaryData?.askPrice),
-    volume: money(String(info.primaryData?.volume ?? "").split(".")[0]),
+    volume: parseVolume(info.primaryData?.volume),
     avgVolume,
     marketCap,
     pe: null,

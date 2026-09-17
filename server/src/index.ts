@@ -8,7 +8,6 @@ import { requireApiKey } from "./auth.js";
 import { rateLimit } from "./rateLimit.js";
 import { getSettings, hasAnyAiKey } from "./settings.js";
 import { flushStaleCache, staleCount } from "./cache.js";
-import { startNotifier } from "./notify.js";
 import { startStream } from "./stream.js";
 
 const app = express();
@@ -103,7 +102,6 @@ console.log(
 );
 const server = app.listen(PORT, HOST, () => {
   console.log(`XAUUSD Terminal API listening on http://${HOST}:${PORT}`);
-  startNotifier();
   startStream();
   if (process.env.PREWARM !== "0") {
     // Background pre-warm so the first click after a cold boot isn't slow:

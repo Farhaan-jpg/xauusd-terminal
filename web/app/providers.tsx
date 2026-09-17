@@ -10,6 +10,12 @@ export default function Providers({ children }: { children: React.ReactNode }) {
         defaultOptions: {
           queries: {
             refetchOnWindowFocus: false,
+            // A trading terminal is watched in a background tab as often as a
+            // focused one. Without this React Query pauses every refetchInterval
+            // once the tab is hidden, silently freezing quotes until the user
+            // clicks back in. Keep polling regardless of visibility.
+            refetchIntervalInBackground: true,
+            refetchOnReconnect: true,
             retry: 1,
             // Never serve stale terminal data — bump to 0 so every query
             // honours its refetchInterval and reads are fresh.

@@ -151,7 +151,13 @@ function withBudget<T>(p: Promise<T>, ms: number, fallback: () => T): Promise<T>
   // early throw beat the timeout, defeating the graceful-degrade pattern used
   // by options / rate-probs / correlations on cloud networks.
   const guarded = p.then((v) => v, () => fallback());
-  return Promise.race([guarded, new Promise<T>((resolve) => setTimeout(() => resolve(fallback()), ms))]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback()), ms);
+  });
+  const race = Promise.race([guarded, timeout]);
+  void race.finally(() => clearTimeout(timer));
+  return race;
 }
 
 /** 30-day Fed Funds futures (ZQ=F) price, three tiers so it works from every
@@ -520,7 +526,25 @@ async function enrichQuote(q: yahoo.Quote): Promise<yahoo.Quote> {
  * A symbol that fails anywhere still falls back to its last-known value
  * instead of failing the whole batch.
  */
-export async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
+// Single-flight: a slow multi-tier provider resolution is shared by every
+// caller polling the same symbol list in the same window (widgets + notifier +
+// prewarm), instead of each stampeding the full fallback chain.
+const inflightQuotes = new Map<string, Promise<yahoo.Quote[]>>();
+const quoteListKey = (symbols: string[]) => [...symbols].sort().join(",");
+
+export function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
+  const key = quoteListKey(symbols);
+  const running = inflightQuotes.get(key);
+  if (running) return running;
+  const p = doGetQuotes(symbols);
+  inflightQuotes.set(key, p);
+  void p.finally(() => {
+    if (inflightQuotes.get(key) === p) inflightQuotes.delete(key);
+  });
+  return p;
+}
+
+async function doGetQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
   const fresh = new Map<string, yahoo.Quote>();
   const missing: string[] = [];
   for (const sym of symbols) {
@@ -593,9 +617,13 @@ export async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
   if (remaining.length > 0) {
     try {
       const rows = await tracked("yahoo", () => yahoo.quotes(remaining.map(yahooSymbol)));
-      for (const q of rows) {
-        const key = Object.keys(YAHOO_ALIAS).find((k) => YAHOO_ALIAS[k] === q.symbol);
-        fetched.set(key ?? q.symbol, { ...q, symbol: key ?? q.symbol });
+      // Match by the *requested* display symbol, not by reverse-aliasing the
+      // returned symbol — aliases like XAUUSD → XAUUSD=X would otherwise store
+      // the quote under the wrong key and the requested symbol drops silently.
+      const bySymbol = new Map(rows.map((q) => [q.symbol, q]));
+      for (const sym of remaining) {
+        const q = bySymbol.get(yahooSymbol(sym));
+        if (q) fetched.set(sym, { ...q, symbol: sym });
       }
       remaining = remaining.filter((s) => !fetched.has(s));
     } catch {
@@ -641,9 +669,13 @@ export async function getQuotes(symbols: string[]): Promise<yahoo.Quote[]> {
   }
 
   if (remaining.length > 0) {
-    const results = await Promise.allSettled(remaining.slice(0, 20).map((s) => tracked("stooq", () => stooq.quote(s))));
+    // Must not slice — the fulfilled results are indexed against the item that
+    // produced them. Past bug: the slice was dropped from the indexer, so a
+    // 20+ symbol batch stored results under `undefined` and silently lost them.
+    const slice = remaining.slice(0, 20);
+    const results = await Promise.allSettled(slice.map((s) => tracked("stooq", () => stooq.quote(s))));
     results.forEach((r, i) => {
-      if (r.status === "fulfilled") fetched.set(remaining[i], r.value);
+      if (r.status === "fulfilled") fetched.set(slice[i], r.value);
     });
   }
 

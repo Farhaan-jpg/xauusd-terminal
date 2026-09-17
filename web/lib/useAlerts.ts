@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, type NewsItem, type Quote } from "../lib/api";
 import { playAlertSound } from "../lib/sounds";
 import { osNotify, pushTray } from "../lib/notify";
+import { useLiveFeed } from "./live";
 import { GOLD_SYMBOL, useTerminal } from "../store/terminal";
 
 type EconEvent = {
@@ -41,9 +42,33 @@ export function useAlerts(): AlertBanner | null {
 
   const pollMs = Math.max(settings?.refreshMs?.quotes ?? 2_000, 1_000);
 
+  const show = useCallback((text: string, tone: AlertBanner["tone"]) => {
+    bannerKey.current += 1;
+    setBanner({ key: bannerKey.current, text, tone });
+    if (bannerTimer.current) clearTimeout(bannerTimer.current);
+    bannerTimer.current = setTimeout(() => setBanner(null), 6_000);
+    // In-app tray entry + OS desktop notification (when enabled/permitted).
+    pushTray(text, tone);
+    const alertsNow = useTerminal.getState().settings?.alerts;
+    if (alertsNow?.notifications !== false) osNotify("XAUUSD Alert", text);
+  }, []);
+
+  // Server-pushed alerts over SSE. When this feed is live the server is the
+  // single alert authority — it runs the SAME rule engine (levels, countdowns,
+  // move detection, keywords) and posts to the webhook too, so the client-side
+  // copies below are gated off to avoid double-firing. The feed also surfaces
+  // the banner instantly rather than waiting for the next poll.
+  const live = useLiveFeed((msg) => {
+    if (msg.type !== "alert") return;
+    const alertsNow = useTerminal.getState().settings?.alerts;
+    if (alertsNow?.sound) playAlertSound(alertsNow.volume ?? 0.5);
+    show(msg.alert.text, msg.alert.tone);
+  });
+  const serverAlerts = live.connected;
+
   const { data: spot } = useQuery({
     queryKey: ["alerts-spot", GOLD_SYMBOL],
-    enabled: alertsOn,
+    enabled: alertsOn && !serverAlerts,
     queryFn: async () => (await apiGet<Quote[]>(`/api/quotes?symbols=${GOLD_SYMBOL}`))[0],
     refetchInterval: pollMs,
   });
@@ -56,7 +81,7 @@ export function useAlerts(): AlertBanner | null {
 
   const { data: levelQuotes } = useQuery({
     queryKey: ["alerts-levels", levelSymbols.join(",")],
-    enabled: alertsOn && levelSymbols.length > 0,
+    enabled: alertsOn && !serverAlerts && levelSymbols.length > 0,
     queryFn: async () => apiGet<Quote[]>(`/api/quotes?symbols=${levelSymbols.join(",")}`),
     refetchInterval: pollMs,
   });
@@ -80,7 +105,7 @@ export function useAlerts(): AlertBanner | null {
   });
 
   // General gold headlines — for user-configured keyword alerts (e.g. "cpi").
-  const kwEnabled = alertsOn && (cfg?.newsKeywords?.length ?? 0) > 0;
+  const kwEnabled = alertsOn && !serverAlerts && (cfg?.newsKeywords?.length ?? 0) > 0;
   const { data: kwNews } = useQuery({
     queryKey: ["alerts-kw-news"],
     enabled: kwEnabled,
@@ -88,21 +113,10 @@ export function useAlerts(): AlertBanner | null {
     refetchInterval: 60_000,
   });
 
-  const show = useCallback((text: string, tone: AlertBanner["tone"]) => {
-    bannerKey.current += 1;
-    setBanner({ key: bannerKey.current, text, tone });
-    if (bannerTimer.current) clearTimeout(bannerTimer.current);
-    bannerTimer.current = setTimeout(() => setBanner(null), 6_000);
-    // In-app tray entry + OS desktop notification (when enabled/permitted).
-    pushTray(text, tone);
-    const alertsNow = useTerminal.getState().settings?.alerts;
-    if (alertsNow?.notifications !== false) osNotify("XAUUSD Alert", text);
-  }, []);
-
   // Price-level triggers: fire once when crossed, then re-arm when price
   // retreats past the level on the far side.
   useEffect(() => {
-    if (!alertsOn || !levelQuotes) return;
+    if (!alertsOn || serverAlerts || !levelQuotes) return;
     const bySym = new Map(levelQuotes.map((q) => [q.symbol.toUpperCase(), q.price]));
     for (const l of cfg?.levels ?? []) {
       const price = bySym.get(l.symbol.toUpperCase());
@@ -125,7 +139,7 @@ export function useAlerts(): AlertBanner | null {
 
   // Spot move threshold (percent between consecutive polls).
   useEffect(() => {
-    if (!alertsOn || !spot?.price) return;
+    if (!alertsOn || serverAlerts || !spot?.price) return;
     const prev = lastPriceRef.current;
     lastPriceRef.current = spot.price;
     if (prev === null) return;
@@ -136,7 +150,7 @@ export function useAlerts(): AlertBanner | null {
       if (cfg?.sound) playAlertSound(cfg.volume ?? 0.5);
       show(`GOLD ${delta >= 0 ? "▲" : "▼"} ${fmtTick(delta)} (${delta >= 0 ? "+" : ""}${changePct.toFixed(2)}%)`, delta >= 0 ? "up" : "down");
     }
-  }, [spot, alertsOn, cfg, show]);
+  }, [spot, alertsOn, serverAlerts, cfg, show]);
 
   // High-impact calendar events as they hit "now".
   useEffect(() => {
@@ -159,7 +173,7 @@ export function useAlerts(): AlertBanner | null {
   // Pre-release countdown: high/medium-impact events due within the configured
   // window announce themselves so you can be at the screen before the print.
   useEffect(() => {
-    if (!alertsOn || !events || !(cfg?.highImpact ?? false)) return;
+    if (!alertsOn || serverAlerts || !events || !(cfg?.highImpact ?? false)) return;
     const windowMin = cfg?.countdownMin ?? 0;
     if (!(windowMin > 0)) return;
     const now = Date.now();
@@ -177,13 +191,13 @@ export function useAlerts(): AlertBanner | null {
       if (cfg?.sound) playAlertSound(cfg.volume ?? 0.5);
       show(`COUNTDOWN · ${e.country} ${e.title.replace(/\s+/g, " ")} in ~${mins}m`, "amber");
     }
-  }, [events, alertsOn, cfg, show]);
+  }, [events, alertsOn, serverAlerts, cfg, show]);
 
   // User-defined news keywords — fire when a fresh headline mentions one.
   const kwSeenRef = useRef(new Set<string>());
   const kwSeededRef = useRef(false);
   useEffect(() => {
-    if (!alertsOn || !kwNews) return;
+    if (!alertsOn || serverAlerts || !kwNews) return;
     const keywords = (cfg?.newsKeywords ?? []).map((k) => k.toLowerCase()).filter((k) => k.length > 0);
     if (keywords.length === 0) return;
     if (!kwSeededRef.current) {
@@ -200,7 +214,7 @@ export function useAlerts(): AlertBanner | null {
       show(`KEYWORD · ${n.title.replace(/\s+/g, " ").slice(0, 90)}`, "amber");
       break; // one headline per poll keeps the terminal calm
     }
-  }, [kwNews, alertsOn, cfg, show]);
+  }, [kwNews, alertsOn, serverAlerts, cfg, show]);
 
   // Breaking geopolitical headlines (High impact, only ones younger than 30m).
   useEffect(() => {

@@ -107,19 +107,34 @@ export function staleCount(): number {
   return staleStore.size;
 }
 
-export async function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
+// In-flight dedup: N concurrent misses for the same key share ONE provider
+// fetch instead of stampeding upstream. The promise is removed when it settles
+// so the next interval's cache miss starts a fresh fetch.
+const inflight = new Map<string, Promise<unknown>>();
+
+export function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   const hit = cacheGet<T>(key);
-  if (hit !== undefined) return hit;
-  try {
-    const value = await fn();
-    cacheSet(key, value, ttlMs);
-    staleSet(key, value);
-    return value;
-  } catch (err) {
-    const stale = staleGet<T>(key);
-    if (stale !== undefined) return stale;
-    throw err;
-  }
+  if (hit !== undefined) return Promise.resolve(hit);
+
+  const running = inflight.get(key);
+  if (running !== undefined) return running as Promise<T>;
+
+  const p = (async (): Promise<T> => {
+    try {
+      const value = await fn();
+      cacheSet(key, value, ttlMs);
+      staleSet(key, value);
+      return value;
+    } catch (err) {
+      const stale = staleGet<T>(key);
+      if (stale !== undefined) return stale;
+      throw err;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+  inflight.set(key, p);
+  return p;
 }
 
 export function cacheStore(key: string, value: unknown, ttlMs: number): void {

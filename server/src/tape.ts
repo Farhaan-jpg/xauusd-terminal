@@ -20,7 +20,10 @@ export function recordTapeTick(symbol: string, tick: TapeTick): void {
     RING.set(key, arr);
   }
   const last = arr[arr.length - 1];
-  if (last && last.t === tick.t && last.price === tick.price) return; // dedupe duplicate timestamps
+  // Snapshot feed: only a price change is a meaningful tape entry. Recording
+  // every 1s poll with an unchanged price (and often an unchanged provider
+  // timestamp) would flood the ring with identical rows.
+  if (last && last.price === tick.price) return;
   arr.push(tick);
   if (arr.length > MAX) arr.splice(0, arr.length - MAX);
 }

@@ -72,7 +72,12 @@ function connect(useDirect: boolean): void {
     next.close();
     es = null;
     setState("dead");
-    startTimer = setTimeout(() => connect(true), 6_000);
+    // Alternate transports on each retry. Previously a single proxy hiccup
+    // switched us to the direct :4000 origin forever — which is unreachable on
+    // a hosted deployment (Render only exposes the web port), so the feed never
+    // recovered. Alternating means the proxied path is retried even after a
+    // direct attempt fails.
+    startTimer = setTimeout(() => connect(!useDirect), 6_000);
   };
   es = next;
 }

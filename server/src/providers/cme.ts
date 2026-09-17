@@ -83,7 +83,9 @@ type ChainResponse = {
 
 function toNum(s: string): number | null {
   if (typeof s !== "string") return null;
-  const v = parseFloat(s);
+  // CME occasionally formats values presentationally ("4,362.5"); parseFloat
+  // would stop at the comma and silently return 4.
+  const v = parseFloat(s.replace(/,/g, ""));
   return Number.isFinite(v) ? v : null;
 }
 
