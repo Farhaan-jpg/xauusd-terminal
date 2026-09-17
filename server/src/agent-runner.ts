@@ -234,7 +234,7 @@ export function getCacheStats(): { size: number; entries: string[] } {
 }
 
 /** Pre-warm models by loading them */
-export async function warmupModels(models: LocalModelId[]): Promise<void> {
-  const manager = getLlamaManager();
+export async function warmupModels(models: LocalModelId[], config?: { port?: number; llmPort?: number; maxModels?: number }): Promise<void> {
+  const manager = getLlamaManager(config ?? { port: 8080, llmPort: 8081, maxModels: 2 });
   await Promise.all(models.map(m => manager.ensureModel(m)));
 }

@@ -246,6 +246,36 @@ async function quoteFromChartViaProxy(yahooSymbol: string): Promise<yahoo.Quote 
   };
 }
 
+/** Fetch Yahoo v8 chart candles through the Jina reader proxy (cloud-friendly).
+ *  Used as a last-resort tier for intraday candles (5m, 15m, 1h, 4h) when
+ *  direct Yahoo access is blocked from cloud IPs (Render, etc.). */
+async function historyFromChartViaProxy(
+  yahooSymbol: string,
+  range: string,
+  interval: string
+): Promise<yahoo.Candle[]> {
+  const enc = encodeURIComponent(yahooSymbol).replace(/%3D/g, "%3d");
+  const url = `https://r.jina.ai/https://query1.finance.yahoo.com/v8/finance/chart/${enc}?range=${range}&interval=${interval}&includePrePost=false`;
+  const text = await cached(`proxychart:history:${yahooSymbol}:${range}:${interval}`, 60_000, async () => {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`r.jina.ai ${res.status}`);
+    return await res.text();
+  }).catch(() => null);
+  if (!text) throw new Error("r.jina.ai: empty response");
+  const result = JSON.parse(text);
+  const resultChart = result?.chart?.result?.[0];
+  if (!resultChart) throw new Error("r.jina.ai: no chart data");
+  const ts: number[] = resultChart.timestamp ?? [];
+  const q = resultChart.indicators?.quote?.[0] ?? {};
+  const candles: yahoo.Candle[] = [];
+  for (let i = 0; i < ts.length; i++) {
+    const [o, h, l, c] = [q.open?.[i], q.high?.[i], q.low?.[i], q.close?.[i]];
+    if (o == null || h == null || l == null || c == null) continue;
+    candles.push({ time: ts[i], open: o, high: h, low: l, close: c, volume: q.volume?.[i] ?? 0 });
+  }
+  return candles;
+}
+
 /** FedWatch-style rate probabilities. FRED reliably serves the current
  *  effective Fed Funds rate from any network. The 30-day Fed Funds futures
  *  (ZQ=F) price comes from zqFuturePrice(), which works on cloud VMs where
@@ -1281,6 +1311,19 @@ async function historyFor(symbol: string, rangeKey: string): Promise<yahoo.Candl
   const spec = rangeSpec(rangeKey);
   if (isVix(symbol)) return vixHistory(rangeKey);
   if (isMeta(symbol)) return metaHistory(symbol, spec);
+
+  // For intraday intervals, try direct providers first, then Jina proxy as last resort
+  if (spec.intraday) {
+    const yahooSym = yahooSymbol(symbol);
+    return withFallback([
+      ["nasdaq", () => nasdaq.history(symbol, rangeKey)], // daily only, will fail for intraday
+      ["yahoo", () => yahoo.history(symbol, spec.range, spec.interval)],
+      ["stooq", () => stooq.history(symbol)], // daily only
+      ["jina", () => historyFromChartViaProxy(yahooSym, spec.range, spec.interval)],
+    ]);
+  }
+
+  // Daily and longer: existing fallback chain
   return withFallback([
     ["nasdaq", () => nasdaq.history(symbol, rangeKey)],
     ["yahoo", () => yahoo.history(symbol, spec.range, spec.interval)],

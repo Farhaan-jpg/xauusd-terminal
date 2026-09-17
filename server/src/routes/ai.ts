@@ -2,7 +2,7 @@ import { Router } from "express";
 import { chatWithFallback } from "../providers/llm.js";
 import { getSettings } from "../settings.js";
 import { runAgent, runAgents, getAgents, getAgent, clearAgentCache, getCacheStats, warmupModels, type AgentInput } from "../agent-runner.js";
-import { getLlamaManager, type LocalModelId, MODEL_SPECS, RECOMMENDED_COMBOS } from "../local-llama.js";
+import { getLlamaManager, type LocalModelId, MODEL_SPECS, RECOMMENDED_COMBOS, type LlamaServerConfig } from "../local-llama.js";
 
 export const aiRouter = Router();
 
@@ -95,8 +95,8 @@ aiRouter.get("/local/models", (_req, res) => {
 
 aiRouter.get("/local/status", async (_req, res) => {
   try {
-    const manager = getLlamaManager();
-    const status = manager.getStatus();
+    const manager = getLlamaManager({ port: 8080, llmPort: 8081, maxModels: 2 } as LlamaServerConfig);
+    const status = await manager.getStatus();
     res.json(status);
   } catch (err) {
     res.json({ server: false, slots: [], error: String(err) });
@@ -105,23 +105,23 @@ aiRouter.get("/local/status", async (_req, res) => {
 
 aiRouter.post("/local/start", async (_req, res) => {
   try {
-    const manager = getLlamaManager();
+    const manager = getLlamaManager({ port: 8080, llmPort: 8081, maxModels: 2 } as LlamaServerConfig);
     await manager.start();
-    res.json({ ok: true, status: manager.getStatus() });
+    res.json({ ok: true, status: await manager.getStatus() });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
 });
 
 aiRouter.post("/local/stop", async (_req, res) => {
-  const manager = getLlamaManager();
+  const manager = getLlamaManager({ port: 8080, llmPort: 8081, maxModels: 2 } as LlamaServerConfig);
   manager.stop();
   res.json({ ok: true });
 });
 
 aiRouter.post("/local/models/:id/download", async (req, res) => {
   try {
-    const manager = getLlamaManager();
+    const manager = getLlamaManager({ port: 8080, llmPort: 8081, maxModels: 2 } as LlamaServerConfig);
     const modelId = req.params.id as LocalModelId;
     if (!MODEL_SPECS[modelId]) {
       return res.status(404).json({ error: "Unknown model" });
@@ -135,13 +135,13 @@ aiRouter.post("/local/models/:id/download", async (req, res) => {
 
 aiRouter.post("/local/models/:id/load", async (req, res) => {
   try {
-    const manager = getLlamaManager();
+    const manager = getLlamaManager({ port: 8080, llmPort: 8081, maxModels: 2 });
     const modelId = req.params.id as LocalModelId;
     if (!MODEL_SPECS[modelId]) {
       return res.status(404).json({ error: "Unknown model" });
     }
     const slot = await manager.ensureModel(modelId);
-    res.json({ ok: true, slot, status: manager.getStatus() });
+    res.json({ ok: true, slot, status: await manager.getStatus() });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -150,7 +150,7 @@ aiRouter.post("/local/models/:id/load", async (req, res) => {
 aiRouter.post("/local/warmup", async (req, res) => {
   try {
     const models = (req.body?.models as LocalModelId[]) ?? RECOMMENDED_COMBOS[0];
-    await warmupModels(models);
+    await warmupModels(models, { port: 8080, llmPort: 8081, maxModels: 2 });
     res.json({ ok: true, models });
   } catch (err) {
     res.status(500).json({ error: String(err) });

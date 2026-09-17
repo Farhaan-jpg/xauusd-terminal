@@ -51,8 +51,8 @@ export const MODEL_SPECS: Record<LocalModelId, ModelSpec> = {
   "qwen2.5-3b": {
     id: "qwen2.5-3b",
     filename: "qwen2.5-3b-instruct-q4_k_m.gguf",
-    url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
-    sizeGB: 2.0,
+    url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf?download=true",
+    sizeGB: 1.95,
     ramGB: 2.7,
     capabilities: ["chat", "classification", "extraction", "indian-languages", "reasoning"],
     description: "Alibaba Qwen 2.5 3B — best for Hindi/Tamil/Telugu/other Indian languages",
@@ -68,21 +68,21 @@ export const MODEL_SPECS: Record<LocalModelId, ModelSpec> = {
   },
   "nomic-embed-v1.5": {
     id: "nomic-embed-v1.5",
-    filename: "nomic-embed-text-v1.5-q4_k_m.gguf",
-    url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5-q4_k_m.gguf",
-    sizeGB: 0.1,
+    filename: "nomic-embed-text-v1.5.Q4_K_S.gguf",
+    url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_S.gguf?download=true",
+    sizeGB: 0.078,
     ramGB: 0.3,
     capabilities: ["embedding"],
-    description: "Nomic Embed v1.5 — semantic search, RAG, clustering (always loaded)",
+    description: "Nomic Embed v1.5 Q4_K_S — semantic search, RAG, clustering (always loaded)",
   },
 };
 
 // Recommended combo for 8GB: embeddings (0.3GB) + one LLM (2.7GB) = ~3GB total
 // Leaves ~5GB for OS + Electron + browser + data
 export const RECOMMENDED_COMBOS: LocalModelId[][] = [
-  ["nomic-embed-v1.5", "phi-3.5-mini"],      // Best reasoning + embeddings (3.3GB)
   ["nomic-embed-v1.5", "qwen2.5-3b"],        // Best Indian languages + embeddings (3.0GB)
   ["nomic-embed-v1.5", "llama-3.2-3b"],      // Balanced + embeddings (3.0GB)
+  ["nomic-embed-v1.5", "phi-3.5-mini"],      // Best reasoning + embeddings (3.3GB)
   ["nomic-embed-v1.5", "smollm2-1.7b"],      // Ultra-light (2.1GB) — for very tight memory
 ];
 

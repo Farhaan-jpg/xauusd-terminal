@@ -5,6 +5,7 @@ import { spawn, ChildProcess, SpawnOptions } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cpus } from "node:os";
 import { MODEL_SPECS, type LocalModelId, type ModelSpec, type ModelCapability } from "./local-ai.js";
 // Use global fetch (Node 18+) instead of undici to avoid Response type conflicts
 
@@ -13,6 +14,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export interface LlamaServerConfig {
   port: number;
   host: string;
+  llmPort?: number;      // separate port for LLM server (default: port + 1)
   modelsDir: string;
   llamaCppPath?: string; // auto-detected if not provided
   nThreads?: number;     // auto = logical cores - 1
@@ -94,6 +96,7 @@ class LlamaCppManager {
   private process: ChildProcess | null = null;
   private config: LlamaServerConfig;
   private baseUrl: string;
+  private llmBaseUrl: string;
   private slots: ModelSlot[] = [];
   private maxSlots: number;
   private modelMap: Map<string, string> = new Map(); // modelId -> filename
@@ -104,16 +107,19 @@ class LlamaCppManager {
   private isProcessing = false;
 
   constructor(config: Partial<LlamaServerConfig> = {}) {
-    const root = join(__dirname, "..", "..");
+    // Compiled JS is in server/dist, so __dirname = server/dist
+    // Go up one level to server/, then into models/
+    const root = join(__dirname, "..");
     const modelsDir = join(root, "models");
     mkdirSync(modelsDir, { recursive: true });
 
     this.config = {
       port: config.port ?? 8080,
       host: config.host ?? "127.0.0.1",
+      llmPort: config.llmPort ?? (config.port ?? 8080) + 1,
       modelsDir,
       llamaCppPath: config.llamaCppPath,
-      nThreads: config.nThreads ?? Math.max(1, (require("node:os").cpus().length ?? 4) - 1),
+      nThreads: config.nThreads ?? Math.max(1, (cpus().length ?? 4) - 1),
       nGpuLayers: config.nGpuLayers ?? 0, // CPU only for i3
       ctxSize: config.ctxSize ?? 4096,
       batchSize: config.batchSize ?? 512,
@@ -122,6 +128,25 @@ class LlamaCppManager {
     this.maxSlots = this.config.maxModels ?? 1;
     this.slots = Array(this.maxSlots).fill(null).map(() => ({ model: null, loadedAt: 0, lastUsed: 0, requestCount: 0 }));
     this.baseUrl = `http://${this.config.host}:${this.config.port}`;
+    this.llmBaseUrl = `http://${this.config.host}:${this.config.llmPort}`;
+    
+    // Map our model IDs to llama.cpp server aliases (models are pre-loaded manually)
+    this.modelMap.set("nomic-embed-v1.5", "embeddings");
+    this.modelMap.set("qwen2.5-3b", "qwen");
+    // Also map by filename for download/load
+    for (const [id, spec] of Object.entries(MODEL_SPECS)) {
+      if (!this.modelMap.has(id)) {
+        this.modelMap.set(id, spec.filename);
+      }
+    }
+    
+    // Pre-populate slots with models that are already loaded on external servers
+    // Embeddings model on baseUrl
+    this.slots[0] = { model: "nomic-embed-v1.5", loadedAt: Date.now(), lastUsed: Date.now(), requestCount: 0 };
+    // LLM model on llmBaseUrl
+    if (this.maxSlots > 1) {
+      this.slots[1] = { model: "qwen2.5-3b", loadedAt: Date.now(), lastUsed: Date.now(), requestCount: 0 };
+    }
   }
 
   /** Auto-detect llama-server binary */
@@ -151,61 +176,18 @@ class LlamaCppManager {
     throw new Error("llama-server not found. Download from https://github.com/ggml-org/llama.cpp/releases");
   }
 
-  /** Start the llama.cpp server */
+  /** Start the llama.cpp server manager (connects to existing servers) */
   async start(): Promise<void> {
     if (this.process && !this.process.killed) return;
     if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
       this.isStarting = true;
-      const binary = await this.findLlamaCpp();
-      
-      const args = [
-        "--host", this.config.host,
-        "--port", String(this.config.port),
-        "--ctx-size", String(this.config.ctxSize),
-        "--batch-size", String(this.config.batchSize),
-        "--threads", String(this.config.nThreads),
-        "--n-gpu-layers", String(this.config.nGpuLayers),
-        "--mlock", // lock memory to prevent swapping
-        "--no-mmap", // disable mmap for better memory control
-        "--parallel", String(this.maxSlots), // number of parallel slots
-        "--cont-batching", // continuous batching for throughput
-        "--defrag-thold", "0.1", // defragment KV cache
-      ];
 
-      // Pre-load embeddings model (tiny, always needed)
-      const embedModel = join(this.config.modelsDir, "nomic-embed-text-v1.5-q4_k_m.gguf");
-      if (existsSync(embedModel)) {
-        args.push("-m", embedModel, "--model-alias", "embeddings");
-      }
-
-      this.process = spawn(binary, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, GGML_LOG_LEVEL: "warn" },
-        windowsHide: true,
-      });
-
-      this.process.stdout?.on("data", (data) => {
-        const msg = data.toString();
-        if (msg.includes("server is listening") || msg.includes("Uvicorn running")) {
-          this.isStarting = false;
-        }
-      });
-
-      this.process.stderr?.on("data", (data) => {
-        console.error("[llama.cpp]", data.toString().trim());
-      });
-
-      this.process.on("exit", (code) => {
-        console.log(`[llama.cpp] exited with code ${code}`);
-        this.process = null;
-        this.slots = this.slots.map(() => ({ model: null, loadedAt: 0, lastUsed: 0, requestCount: 0 }));
-      });
-
-      // Wait for server ready
+      // Wait for existing servers to be ready (we run them manually)
       await this.waitForHealthy(30000);
       this.startHealthChecks();
+      this.isStarting = false;
     })();
 
     return this.startPromise;
@@ -215,18 +197,29 @@ class LlamaCppManager {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
-        const res = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
-        if (res.ok) return;
+        const [embeddingsOk, llmOk] = await Promise.all([
+          fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+          fetch(`${this.llmBaseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+        ]);
+        if (embeddingsOk && llmOk) return;
       } catch { /* wait */ }
       await new Promise(r => setTimeout(r, 500));
     }
-    throw new Error("llama.cpp server failed to start within timeout");
+    throw new Error("llama.cpp servers failed to start within timeout");
   }
 
   private startHealthChecks(): void {
     this.healthCheckInterval = setInterval(async () => {
       try {
-        await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
+        const [embeddingsOk, llmOk] = await Promise.all([
+          fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+          fetch(`${this.llmBaseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+        ]);
+        if (!embeddingsOk || !llmOk) {
+          console.warn("[llama.cpp] health check failed, restarting...");
+          this.stop();
+          await this.start();
+        }
       } catch {
         console.warn("[llama.cpp] health check failed, restarting...");
         this.stop();
@@ -235,7 +228,7 @@ class LlamaCppManager {
     }, 30000);
   }
 
-  /** Load a model into a slot (unloads least-recently-used if full) */
+  /** Load a model into a slot (uses correct server based on model type) */
   async loadModel(modelId: string, slot?: number): Promise<number> {
     await this.start();
     
@@ -246,6 +239,10 @@ class LlamaCppManager {
       throw new Error(`Model not found: ${modelPath}. Download first.`);
     }
 
+    // Determine which server to use
+    const isEmbedding = modelId === "nomic-embed-v1.5";
+    const serverUrl = isEmbedding ? this.baseUrl : this.llmBaseUrl;
+
     // Find slot
     let targetSlot = slot ?? this.findBestSlot();
     const currentModel = this.slots[targetSlot]?.model;
@@ -255,12 +252,13 @@ class LlamaCppManager {
       return targetSlot;
     }
 
-    // Load model into slot
-    const res = await fetch(`${this.baseUrl}/v1/models/load`, {
+    // Load model into slot on the correct server
+    const modelAlias = this.modelMap.get(modelId) ?? modelId;
+    const res = await fetch(`${serverUrl}/v1/models/load`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: modelPath,
+        model: modelAlias,
         slot: targetSlot,
         n_ctx: this.config.ctxSize,
         n_gpu_layers: this.config.nGpuLayers,
@@ -301,6 +299,25 @@ class LlamaCppManager {
       this.slots[existing]!.requestCount++;
       return existing;
     }
+    
+    // Check if model is already loaded on the server
+    const isEmbedding = modelId === "nomic-embed-v1.5";
+    const serverUrl = isEmbedding ? this.baseUrl : this.llmBaseUrl;
+    try {
+      const res = await fetch(`${serverUrl}/v1/models`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        const modelAlias = this.modelMap.get(modelId) ?? modelId;
+        const found = data.data?.some((m: any) => m.id === modelAlias);
+        if (found) {
+          // Model is already loaded on server, just add to local slots
+          const targetSlot = this.findBestSlot();
+          this.slots[targetSlot] = { model: modelId, loadedAt: Date.now(), lastUsed: Date.now(), requestCount: 0 };
+          return targetSlot;
+        }
+      }
+    } catch { /* ignore */ }
+    
     return this.loadModel(modelId);
   }
 
@@ -308,7 +325,7 @@ class LlamaCppManager {
   async complete(req: CompletionRequest): Promise<CompletionResponse> {
     await this.ensureModel(req.model);
     return this.requestWithRetry(() => 
-      fetch(`${this.baseUrl}/v1/completions`, {
+      fetch(`${this.llmBaseUrl}/v1/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(req),
@@ -317,7 +334,7 @@ class LlamaCppManager {
     );
   }
 
-  /** Embeddings (uses always-loaded embeddings model) */
+  /** Embeddings (uses embeddings server) */
   async embed(req: EmbeddingRequest): Promise<EmbeddingResponse> {
     await this.ensureModel("nomic-embed-v1.5");
     return this.requestWithRetry(() =>
@@ -330,10 +347,10 @@ class LlamaCppManager {
     );
   }
 
-  /** Chat completion (OpenAI-compatible) */
+  /** Chat completion (uses LLM server) */
   async chat(messages: Array<{role: string; content: string}>, model: string, options: Partial<CompletionRequest> = {}): Promise<string> {
     await this.ensureModel(model);
-    const res = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+    const res = await fetch(`${this.llmBaseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -407,9 +424,20 @@ class LlamaCppManager {
   }
 
   /** Get status of all slots */
-  getStatus(): { server: boolean; slots: LoadedModel[]; memory: { used: number; total: number } } {
+  async getStatus(): Promise<{ server: boolean; slots: LoadedModel[]; memory: { used: number; total: number } }> {
+    let embeddingsOk = false;
+    let llmOk = false;
+    try {
+      const [embeddingsRes, llmRes] = await Promise.all([
+        fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+        fetch(`${this.llmBaseUrl}/health`, { signal: AbortSignal.timeout(2000) }).then(r => r.ok).catch(() => false),
+      ]);
+      embeddingsOk = embeddingsRes;
+      llmOk = llmRes;
+    } catch { /* ignore */ }
+    
     return {
-      server: this.process !== null && !this.process.killed,
+      server: embeddingsOk && llmOk,
       slots: this.slots.map((s, i) => ({
         id: `slot-${i}`,
         model: s.model ?? "",
@@ -428,10 +456,8 @@ class LlamaCppManager {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
     }
-    if (this.process && !this.process.killed) {
-      this.process.kill("SIGTERM");
-      this.process = null;
-    }
+    // We don't kill the process since we're using external servers
+    this.process = null;
     this.slots = this.slots.map(() => ({ model: null, loadedAt: 0, lastUsed: 0, requestCount: 0 }));
   }
 }
